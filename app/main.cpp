@@ -120,10 +120,15 @@ int main(int argc, char *argv[])
     KDBusService dbusService(flags);
     QQmlApplicationEngine engine;
     KLocalization::setupLocalizedContext(&engine);
+    QObject::connect(&engine, &QQmlApplicationEngine::warnings, &app, [](const QList<QQmlError> &warnings) {
+        for (const auto &err : warnings) {
+            fprintf(stderr, "QML WARNING: %s\n", qPrintable(err.toString()));
+        }
+    });
     engine.loadFromModule("org.kde.kdeconnect.app", "Main");
 
     if (engine.rootObjects().isEmpty()) {
-        qWarning() << "Failed to load the app" << engine.hasError();
+        fprintf(stderr, "Failed to load the app, rootObjects empty!\n");
         return 1;
     }
     auto obj = qobject_cast<QWindow *>(engine.rootObjects().constFirst());

@@ -66,7 +66,7 @@ Kirigami.ApplicationWindow {
 
     DevicesModel {
         id: devicesModel
-        onBusyChanged: (busy) => {
+        onBusyChanged: {
             if (!busy && root.pendingDeviceId) {
                 root.openDevice(root.pendingDeviceId, root.pendingPluginConfig);
             }
