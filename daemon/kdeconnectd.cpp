@@ -72,12 +72,12 @@ int main(int argc, char *argv[])
     qputenv("SOLID_DISABLE_KDECONNECT", "1");
 
     QApplication app(argc, argv);
-    KAboutData aboutData(QStringLiteral("kdeconnect.daemon"),
-                         i18n("KDE Connect Daemon"),
+    KAboutData aboutData(QStringLiteral("kdeconnectify.daemon"),
+                         i18n("KDE Connectify Daemon"),
                          QStringLiteral(KDECONNECT_VERSION_STRING),
-                         i18n("KDE Connect Daemon"),
+                         i18n("KDE Connectify Daemon"),
                          KAboutLicense::GPL,
-                         i18n("© 2015–2025 KDE Connect Team"));
+                         i18n("© 2015–2026 KDE Connectify Team"));
     KAboutData::setApplicationData(aboutData);
     app.setQuitOnLastWindowClosed(false);
 

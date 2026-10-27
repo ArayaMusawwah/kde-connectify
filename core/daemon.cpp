@@ -69,7 +69,7 @@ void Daemon::init()
 
     qDBusRegisterMetaType<QMap<QString, QString>>();
     qDBusRegisterMetaType<QByteArrayList>();
-    QDBusConnection::sessionBus().registerService(QStringLiteral("org.kde.kdeconnect"));
+    QDBusConnection::sessionBus().registerService(QStringLiteral("org.kde.kdeconnectify"));
     QDBusConnection::sessionBus().registerObject(QStringLiteral("/modules/kdeconnect"), this, QDBusConnection::ExportScriptableContents);
 
     qCDebug(KDECONNECT_CORE) << "DBus registration complete";

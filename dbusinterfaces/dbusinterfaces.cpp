@@ -8,7 +8,7 @@
 
 QString DaemonDbusInterface::activatedService()
 {
-    static const QString service = QStringLiteral("org.kde.kdeconnect");
+    static const QString service = QStringLiteral("org.kde.kdeconnectify");
 
     auto reply = QDBusConnection::sessionBus().interface()->startService(service);
     if (!reply.isValid()) {
@@ -46,7 +46,7 @@ QString DeviceDbusInterface::id() const
 
 void DeviceDbusInterface::pluginCall(const QString &plugin, const QString &method)
 {
-    QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+    QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                       QStringLiteral("/modules/kdeconnect/devices/") + id() + QStringLiteral("/") + plugin,
                                                       QStringLiteral("org.kde.kdeconnect.device.") + plugin,
                                                       method);

@@ -1,6 +1,6 @@
-# Super KDE Connect 🚀
+# KDE Connectify 🚀
 
-> **Super KDE Connect** is an enhanced, next-generation build of **KDE Connect** (`kdeconnect-kde`) integrated with the high-performance media, hardware, and transport capabilities of **Linksy** (`linksy-desktop`).
+> **KDE Connectify** is an enhanced, next-generation build of **KDE Connect** (`kdeconnect-kde`) integrated with the high-performance media, hardware, and transport capabilities of **Linksy** (`linksy-desktop`).
 
 It combines KDE Connect's mature desktop integration (Plasma, GNOME, notifications, SMS, clipboard, MPRIS) with Linksy's low-latency streaming pipeline (QUIC, PipeWire, GStreamer, Wayland portals, Android Open Accessory USB).
 
@@ -8,7 +8,7 @@ It combines KDE Connect's mature desktop integration (Plasma, GNOME, notificatio
 
 ## 🌟 Key Features
 
-In addition to all standard KDE Connect features, Super KDE Connect brings 8 advanced features:
+In addition to all standard KDE Connect features, KDE Connectify brings 8 advanced features:
 
 | Feature | Description | Protocol / Tech |
 |---|---|---|
@@ -25,7 +25,7 @@ In addition to all standard KDE Connect features, Super KDE Connect brings 8 adv
 
 ## 🏗️ Architecture
 
-Super KDE Connect uses a **zero-overhead Rust FFI Bridge via Corrosion** and **Modular C++ Plugins**:
+KDE Connectify uses a **zero-overhead Rust FFI Bridge via Corrosion** and **Modular C++ Plugins**:
 
 ```
 [ Android: Linksy Mobile / KDE Connect Mobile ]
@@ -86,8 +86,8 @@ Ensure you have the following installed:
 
 ```bash
 # 1. Clone repository with submodules
-git clone --recursive https://github.com/ArayaMusawwah/super-kdeconnect.git
-cd super-kdeconnect
+git clone --recursive https://github.com/ArayaMusawwah/kde-connectify.git
+cd kde-connectify
 
 # 2. Configure build
 cmake -B build -S . \
@@ -118,4 +118,4 @@ Desktop communicates directly with:
 
 ## 📄 License
 
-Super KDE Connect is licensed under the [GNU General Public License v2.0 or later](LICENSES/GPL-2.0-only.txt) and [GNU General Public License v3.0 or later](LICENSES/GPL-3.0-only.txt), consistent with KDE Connect and Linksy.
+KDE Connectify is licensed under the [GNU General Public License v2.0 or later](LICENSES/GPL-2.0-only.txt) and [GNU General Public License v3.0 or later](LICENSES/GPL-3.0-only.txt), consistent with KDE Connect and Linksy.

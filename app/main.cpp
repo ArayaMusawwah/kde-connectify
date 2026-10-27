@@ -41,12 +41,12 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     KLocalizedString::setApplicationDomain("kdeconnect-app");
     app.setWindowIcon(QIcon::fromTheme(QStringLiteral("kdeconnect")));
-    KAboutData aboutData(QStringLiteral("kdeconnect.app"),
-                         i18n("KDE Connect"),
+    KAboutData aboutData(QStringLiteral("kdeconnectify.app"),
+                         i18n("KDE Connectify"),
                          QStringLiteral(KDECONNECT_VERSION_STRING),
-                         i18n("KDE Connect"),
+                         i18n("KDE Connectify"),
                          KAboutLicense::GPL,
-                         i18n("© 2015–2025 KDE Connect Team"));
+                         i18n("© 2015–2026 KDE Connectify Team"));
     aboutData.addAuthor(i18n("Aleix Pol Gonzalez"), {}, QStringLiteral("aleixpol@kde.org"));
     aboutData.addAuthor(i18n("Albert Vaca Cintora"), {}, QStringLiteral("albertvaka@kde.org"));
     aboutData.setTranslator(i18nc("NAME OF TRANSLATORS", "Your names"), i18nc("EMAIL OF TRANSLATORS", "Your emails"));
