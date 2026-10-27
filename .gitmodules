@@ -1,0 +1,3 @@
+[submodule "3rdparty/linksy-desktop"]
+	path = 3rdparty/linksy-desktop
+	url = https://github.com/LinkSy-mg/linksy-desktop.git

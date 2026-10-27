@@ -35,3 +35,8 @@ CMakeLists.txt.user
 /cmake-build*
 app/resources.generated.qrc
 smsapp/resources.generated.qrc
+/3rdparty/extra-cmake-modules/
+/3rdparty/wayland-protocols/
+/3rdparty/linksy-desktop/target/
+/core/linksy-ffi/target/
+/.superpowers/

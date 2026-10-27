@@ -1,80 +1,121 @@
-# KDE Connect - desktop app
+# Super KDE Connect 🚀
 
-KDE Connect is a multi-platform app that allows your devices to communicate (eg: your phone and your computer).
+> **Super KDE Connect** is an enhanced, next-generation build of **KDE Connect** (`kdeconnect-kde`) integrated with the high-performance media, hardware, and transport capabilities of **Linksy** (`linksy-desktop`).
 
-## (Some) Features
-- **Shared clipboard**: copy and paste between your phone and your computer (or any other device).
-- **Notification sync**: Read and reply to your Android notifications from the desktop.
-- **Share files and URLs** instantly from one device to another including some filesystem integration.
-- **Multimedia remote control**: Use your phone as a remote for Linux media players.
-- **Virtual touchpad**: Use your phone screen as your computer's touchpad and keyboard.
-- **Presentation remote**: Advance your presentation slides straight from your phone.
-- **Run Commands**: Run shell commands on your computer from your phone.
-- **Access SMS**: Read, send and reply to SMS and MMS from your computer.
+It combines KDE Connect's mature desktop integration (Plasma, GNOME, notifications, SMS, clipboard, MPRIS) with Linksy's low-latency streaming pipeline (QUIC, PipeWire, GStreamer, Wayland portals, Android Open Accessory USB).
 
-All this is done completely wirelessly, utilising TLS encryption.
+---
 
-## Userbase wiki
-A user-focused wiki can be found on [KDE Userbase](https://userbase.kde.org/KDEConnect)
+## 🌟 Key Features
 
-## Supported platforms
-- Computers running Linux with Plasma, GNOME, elementary OS… any distro with Qt 6 support :)
-- Android, by installing the KDE Connect app from the [Play Store](https://play.google.com/store/apps/details?id=org.kde.kdeconnect_tp) or [F-Droid](https://f-droid.org/repository/browse/?fdid=org.kde.kdeconnect_tp).
-- iPhone and iPad, by installing from the [App Store](https://apps.apple.com/us/app/kde-connect/id1580245991)
-- Computers running Windows, by installing from the [Microsoft Store](https://apps.microsoft.com/store/detail/kde-connect/9N93MRMSXBF0)
+In addition to all standard KDE Connect features, Super KDE Connect brings 8 advanced features:
 
-## How to install
-These instructions explain how to install KDE Connect on your computer. You will also need to install it on your Android device and pair them together in the app before using this application. The Android app repository can be found [here](https://invent.kde.org/network/kdeconnect-android)
+| Feature | Description | Protocol / Tech |
+|---|---|---|
+| 🖥️ **Sidecar (Second Display)** | Use your Android tablet or phone as a virtual secondary monitor for your desktop with touch and keyboard input. | Wayland KWin / DRM + GStreamer H.264 (QUIC `display`) |
+| 📷 **Phone as Virtual Webcam** | Stream phone camera directly into Linux apps (OBS, Zoom, Meet, Teams) as a native PipeWire camera device ("Linksy Camera"). Supports front/back switch, zoom, and 60 FPS. | QUIC `camera` + PipeWire `pw_stream` / v4l2loopback |
+| 🎙️ **Phone as Microphone** | Low-latency audio input directly into PipeWire ("Linksy Microphone"). No Bluetooth compression or lag. | Raw PCM 16-bit 48kHz mono (QUIC `microphone`) |
+| 🪞 **Screen Mirror & Remote Desktop** | High-framerate real-time desktop screen mirroring to phone/tablet or vice versa, with remote mouse and keyboard input. | Wayland Portal `ScreenCast` & `RemoteDesktop` + H.264 |
+| ⚡ **USB Cable Mode (AOA)** | Connect phone directly via USB cable using Android Open Accessory. Zero Wi-Fi needed, no ADB/developer mode required, lowest latency (< 5ms). | Linux USB bulk transfer + loopback QUIC bridge |
+| 🌐 **Away from Home (WAN P2P)** | Connect to paired devices securely over the Internet without port forwarding or public IP. | `iroh` P2P NAT traversal + cryptographic lease |
+| ⚡ **Wi-Fi Direct Transfer** | Automatic ad-hoc 5GHz direct connection for transfers $\ge 256$ MB achieving speeds up to 80 MB/s. | Wi-Fi P2P Group + NetworkManager DBus |
+| 💻 **Secure Remote Terminal** | Interactive shell session on your PC from your mobile device, protected by a desktop-generated 6-digit PIN. | Unix PTY (`openpty`) + JSON framing |
 
-### On Linux
-Look in your distribution repo for a package called `kdeconnect-kde`,
-`kdeconnect-plasma`, just `kdeconnect` or `kde-connect`.
-If it's not there and you know how to build software from sources, you just
-found the repo :), instructions are
-[here](https://community.kde.org/KDEConnect#Linux_Desktop)
+---
 
-### On Mac or Windows
-Platforms other than Linux are not officially supported, as there has yet to be an official release of KDE Connect for MacOS or Windows. However, most of the features have already been ported to windows so you can compile KDE Connect for Windows using [Craft](https://community.kde.org/Craft). It hasn't yet been completely tested on MacOS, contributions and feedback are welcome!
+## 🏗️ Architecture
 
-### On BSD
-It should work, but no promises :)
+Super KDE Connect uses a **zero-overhead Rust FFI Bridge via Corrosion** and **Modular C++ Plugins**:
 
-
-## How does it work?
-KDE Connect consists of a UI-agnostic "core" library that exposes a series of DBus interfaces, and several UI components that consume these DBus interfaces. This way, new UI components can be added to integrate better with specific platforms or desktops, without having to reimplement the protocol or any of the internals. The core KDE Connect library is also divided into 4 big blocks:
-
-- **LinkProviders**: Are in charge of discovering other KDE Connect-enabled devices in the network and establishing a Link to them.
-- **Devices**: Represent a remote device, abstracting the specific Link that is being used to reach it.
-- **NetworkPackets**: JSON-serializable and self-contained pieces of information to be sent by the plugins between devices.
-- **Plugins**: Independent pieces of code that implement a specific feature. Plugins will use NetworkPackets to exchange information through the network with other Plugins on a remote Device.
-
-The basic structure of a NetworkPacket is the following:
-
-```json
-{
-  "id": 123456789,
-  "type": "com.example.myplugin",
-  "body": {  },
-  "version": 5
-}
+```
+[ Android: Linksy Mobile / KDE Connect Mobile ]
+                        │
+                        ▼ (QUIC / TLS 1.3 / mDNS / AOA / Iroh)
+┌─────────────────────────────────────────────────────────────┐
+│ KDE Connect Desktop Core (`kdeconnectcore`)                 │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ Rust FFI Core Layer (`core/linksy-ffi`)              │   │
+│  │  - Quinn QUIC & Rustls TLS 1.3 mutual auth           │   │
+│  │  - mDNS & HMAC Private Discovery                     │   │
+│  │  - Iroh WAN P2P Endpoint                             │   │
+│  │  - AOA USB Device Loopback                           │   │
+│  └──────────────────────────┬───────────────────────────┘   │
+│                             │ C-ABI (Corrosion CMake)       │
+│  ┌──────────────────────────▼───────────────────────────┐   │
+│  │ C++ Daemon Core (`kdeconnectd`)                      │   │
+│  │  - LinksyLinkProvider : public LinkProvider          │   │
+│  │  - LinksyDeviceLink   : public DeviceLink            │   │
+│  └──────────────────────────┬───────────────────────────┘   │
+│                             │ Qt Signals / Slots            │
+│  ┌──────────────────────────▼───────────────────────────┐   │
+│  │ Modular C++ Plugins:                                 │   │
+│  │  - `kdeconnect_webcam`                               │   │
+│  │  - `kdeconnect_microphone`                           │   │
+│  │  - `kdeconnect_sidecar`                              │   │
+│  │  - `kdeconnect_screenmirror`                         │   │
+│  │  - `kdeconnect_terminal`                             │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-The content of the `"body"` section is defined by each Plugin. Hence, only the emitter and receiver plugins of a given packet type need agree on the contents of the body.
+---
 
-NetworkPackets can also have binary data attached that can't be serialized to JSON. In this case, two new fields will be added:
+## 🎨 UI/UX Design Standards
 
-`"payloadSize"`: The size of the file, or -1 if it is a stream without known size.
-`"payloadTransferInfo"`: Another JSON object where the specific Link can add information so the Link in the remote end can establish a connection and receive the payload (eg: IP and port in a local network). It's up to the Link implementation to decide how to use this field.
+- **Strict 8-Point Spatial Grid**: Consistent 16px margins, 12px card spacing, and pixel-perfect symmetry for visual harmony.
+- **Accessibility (WCAG AA Compliance)**: All text and action elements maintain contrast ratios $\ge 4.5:1$ on both light and dark themes.
+- **Dual Status Indicators**: States are indicated with both clear badge text (`[ ACTIVE ]` / `[ STANDBY ]`) and color coding.
+- **Plasma System Tray Integration**: Direct quick-actions in the Plasmoid menu for one-click Webcam or Second Display activation.
 
-## Contributing
+---
 
-To contribute patches, use [KDE Connect's GitLab](https://invent.kde.org/network/kdeconnect-kde). There you can also find a task list with stuff to do and links to other relevant resources. It is a good idea to also subscribe to the [KDE Connect mailing list](https://mail.kde.org/mailman/listinfo/kdeconnect). We can also be reached on IRC at #kdeconnect on irc.libera.chat or on [Telegram](https://t.me/joinchat/AOS6gA37orb2dZCLhqbZjg), contributions and feedback are warmly welcomed.
+## 🔧 Building from Source
 
-For bug reporting, please use [KDE's Bugzilla](https://bugs.kde.org). Please do not use the issue tracker in GitLab since we want to keep everything in one place.
+### Prerequisites
 
-Please know that all translations for all KDE apps are handled by the [localization team](https://l10n.kde.org/). If you would like to submit a translation, that should be done by working with the proper team for that language.
+Ensure you have the following installed:
+- C++ compiler with C++20 support (GCC 13+ or Clang 16+)
+- CMake 3.25+
+- Rust toolchain (stable `rustc` & `cargo`)
+- Qt 6 (Core, DBus, Gui, Network, Quick, Multimedia, WaylandClient)
+- KDE Frameworks 6 (CoreAddons, I18n, KIO, Kirigami, Notifications, StatusNotifierItem)
+- PipeWire development headers (`libpipewire-0.3`)
 
-## License
-[GNU GPL v2](https://www.gnu.org/licenses/gpl-2.0.html) and [GNU GPL v3](https://www.gnu.org/licenses/gpl-3.0.html)
+### Build Steps
 
-If you are reading this from Github, you should know that this is just a mirror of the [KDE Project repo](https://invent.kde.org/network/kdeconnect-kde).
+```bash
+# 1. Clone repository with submodules
+git clone --recursive https://github.com/ArayaMusawwah/super-kdeconnect.git
+cd super-kdeconnect
+
+# 2. Configure build
+cmake -B build -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF
+
+# 3. Build daemon, libraries, and plugins
+cmake --build build -j$(nproc)
+
+# 4. Run tests
+cargo test --manifest-path core/linksy-ffi/Cargo.toml
+```
+
+Artifacts will be located in:
+- Daemon & CLI: `build/bin/kdeconnectd`, `build/bin/kdeconnect-cli`
+- Core Library: `build/bin/libkdeconnectcore.so`
+- New Plugins: `build/bin/kdeconnect/kdeconnect_{webcam,microphone,sidecar,screenmirror,terminal}.so`
+
+---
+
+## 📱 Mobile Compatibility
+
+Desktop communicates directly with:
+1. **Linksy Android App** (Flutter + `linksy-core` compiled via NDK) for full 8-feature support.
+2. Standard **KDE Connect Android App** for legacy notifications, clipboard, SMS, and media controls.
+
+---
+
+## 📄 License
+
+Super KDE Connect is licensed under the [GNU General Public License v2.0 or later](LICENSES/GPL-2.0-only.txt) and [GNU General Public License v3.0 or later](LICENSES/GPL-3.0-only.txt), consistent with KDE Connect and Linksy.

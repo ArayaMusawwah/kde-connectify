@@ -1,0 +1,19 @@
+[package]
+name = "linksy-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+linksy-core = { path = "../../3rdparty/linksy-desktop/crates/linksy-core" }
+uuid = { version = "1.28", features = ["v4", "serde"] }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.27"

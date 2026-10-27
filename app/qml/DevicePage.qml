@@ -259,6 +259,36 @@ Kirigami.ScrollablePage {
                 device: root.currentDevice
             },
             PluginItem {
+                pluginName: "sidecar"
+                name: i18n("Second Display (Sidecar)")
+                section: "action"
+                device: root.currentDevice
+            },
+            PluginItem {
+                pluginName: "webcam"
+                name: i18n("Virtual Webcam")
+                section: "action"
+                device: root.currentDevice
+            },
+            PluginItem {
+                pluginName: "microphone"
+                name: i18n("Virtual Microphone")
+                section: "action"
+                device: root.currentDevice
+            },
+            PluginItem {
+                pluginName: "screenmirror"
+                name: i18n("Screen Mirror & Control")
+                section: "action"
+                device: root.currentDevice
+            },
+            PluginItem {
+                pluginName: "terminal"
+                name: i18n("Remote Terminal Shell")
+                section: "action"
+                device: root.currentDevice
+            },
+            PluginItem {
                 pluginName: "battery"
                 name: batteryInfo.displayString
                 iconNameOverride: batteryInfo.iconName

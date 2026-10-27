@@ -1,0 +1,23 @@
+{
+    "$schema": "../kdeconnect.schema.json",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "info@kdeconnect.org",
+                "Name": "Super KDE Connect Contributors"
+            }
+        ],
+        "Description": "Secure interactive remote shell session from phone to PC protected by PIN",
+        "Icon": "utilities-terminal",
+        "Id": "kdeconnect_terminal",
+        "Name": "Remote Terminal"
+    },
+    "X-KdeConnect-OutgoingPacketType": [
+        "kdeconnect.linksy.terminal",
+        "kdeconnect.linksy.terminal.data"
+    ],
+    "X-KdeConnect-SupportedPacketType": [
+        "kdeconnect.linksy.terminal",
+        "kdeconnect.linksy.terminal.data"
+    ]
+}

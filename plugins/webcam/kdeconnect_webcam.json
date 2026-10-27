@@ -1,0 +1,23 @@
+{
+    "$schema": "../kdeconnect.schema.json",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "info@kdeconnect.org",
+                "Name": "Super KDE Connect Contributors"
+            }
+        ],
+        "Description": "Use your phone camera as a high definition webcam in PipeWire",
+        "Icon": "camera-web",
+        "Id": "kdeconnect_webcam",
+        "Name": "Virtual Webcam"
+    },
+    "X-KdeConnect-OutgoingPacketType": [
+        "kdeconnect.linksy.camera",
+        "kdeconnect.linksy.camera.control"
+    ],
+    "X-KdeConnect-SupportedPacketType": [
+        "kdeconnect.linksy.camera",
+        "kdeconnect.linksy.camera.control"
+    ]
+}

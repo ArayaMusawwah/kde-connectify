@@ -1,0 +1,23 @@
+{
+    "$schema": "../kdeconnect.schema.json",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "info@kdeconnect.org",
+                "Name": "Super KDE Connect Contributors"
+            }
+        ],
+        "Description": "Use your phone or tablet as a second display (Sidecar) with touch input",
+        "Icon": "video-display",
+        "Id": "kdeconnect_sidecar",
+        "Name": "Sidecar (Second Display)"
+    },
+    "X-KdeConnect-OutgoingPacketType": [
+        "kdeconnect.linksy.sidecar",
+        "kdeconnect.linksy.sidecar.control"
+    ],
+    "X-KdeConnect-SupportedPacketType": [
+        "kdeconnect.linksy.sidecar",
+        "kdeconnect.linksy.sidecar.control"
+    ]
+}

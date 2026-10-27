@@ -2,6 +2,8 @@ add_definitions(-DTRANSLATION_DOMAIN=\"kdeconnect-core\")
 
 add_subdirectory(backends/lan)
 add_subdirectory(backends/loopback)
+add_subdirectory(backends/linksy)
+add_subdirectory(linksy-ffi)
 
 option(BLUETOOTH_ENABLED "Bluetooth support for kdeconnect" ON)
 if(BLUETOOTH_ENABLED)
@@ -17,6 +19,7 @@ qt_extract_metatypes(kdeconnectcore)
 
 target_sources(kdeconnectcore PRIVATE
     ${backends_kdeconnect_SRCS}
+    ${backends_linksy_SRCS}
 
     backends/linkprovider.cpp
     backends/devicelink.cpp
@@ -44,7 +47,11 @@ ecm_qt_declare_logging_category(kdeconnectcore
     EXPORT kdeconnect-kde DESCRIPTION "kdeconnect (core)")
 
 
-target_include_directories(kdeconnectcore PUBLIC ${PROJECT_SOURCE_DIR})
+target_include_directories(kdeconnectcore PUBLIC
+    ${PROJECT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/linksy
+    ${CMAKE_CURRENT_SOURCE_DIR}/linksy-ffi/include
+)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
@@ -55,6 +62,7 @@ PUBLIC
     KF6::KIOCore
     KF6::KIOGui
     OpenSSL::Crypto
+    linksy_ffi
 PRIVATE
     Qt::DBus
     KF6::I18n

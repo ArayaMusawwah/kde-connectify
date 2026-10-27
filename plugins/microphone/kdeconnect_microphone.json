@@ -1,0 +1,23 @@
+{
+    "$schema": "../kdeconnect.schema.json",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "info@kdeconnect.org",
+                "Name": "Super KDE Connect Contributors"
+            }
+        ],
+        "Description": "Use your phone as a low-latency microphone via PipeWire",
+        "Icon": "audio-input-microphone",
+        "Id": "kdeconnect_microphone",
+        "Name": "Virtual Microphone"
+    },
+    "X-KdeConnect-OutgoingPacketType": [
+        "kdeconnect.linksy.mic",
+        "kdeconnect.linksy.mic.control"
+    ],
+    "X-KdeConnect-SupportedPacketType": [
+        "kdeconnect.linksy.mic",
+        "kdeconnect.linksy.mic.control"
+    ]
+}

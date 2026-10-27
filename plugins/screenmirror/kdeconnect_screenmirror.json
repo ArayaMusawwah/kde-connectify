@@ -1,0 +1,23 @@
+{
+    "$schema": "../kdeconnect.schema.json",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "info@kdeconnect.org",
+                "Name": "Super KDE Connect Contributors"
+            }
+        ],
+        "Description": "Real-time screen mirroring and remote desktop control via Wayland",
+        "Icon": "preferences-desktop-display",
+        "Id": "kdeconnect_screenmirror",
+        "Name": "Screen Mirror & Control"
+    },
+    "X-KdeConnect-OutgoingPacketType": [
+        "kdeconnect.linksy.screen",
+        "kdeconnect.linksy.screen.control"
+    ],
+    "X-KdeConnect-SupportedPacketType": [
+        "kdeconnect.linksy.screen",
+        "kdeconnect.linksy.screen.control"
+    ]
+}

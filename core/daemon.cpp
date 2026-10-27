@@ -25,6 +25,7 @@
 #include "backends/devicelink.h"
 #include "backends/lan/lanlinkprovider.h"
 #include "backends/linkprovider.h"
+#include "backends/linksy/linksylinkprovider.h"
 #include "backends/loopback/loopbacklinkprovider.h"
 #include "device.h"
 
@@ -84,6 +85,9 @@ void Daemon::init()
     } else {
         d->m_linkProviders.insert(new LanLinkProvider(false, disabledLinkProviders.contains(QStringLiteral("lan"))));
         qCDebug(KDECONNECT_CORE) << "Constructed LanLinkProvider Backend";
+
+        d->m_linkProviders.insert(new LinksyLinkProvider(disabledLinkProviders.contains(QStringLiteral("linksy"))));
+        qCDebug(KDECONNECT_CORE) << "Constructed LinksyLinkProvider Backend";
 #ifdef KDECONNECT_BLUETOOTH
         d->m_linkProviders.insert(new BluetoothLinkProvider(disabledLinkProviders.contains(QStringLiteral("bluetooth"))));
         qCDebug(KDECONNECT_CORE) << "Constructed BluetoothLinkProvider Backend";
