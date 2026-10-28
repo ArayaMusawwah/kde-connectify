@@ -246,6 +246,28 @@ fn dispatch_event(event: Event, cbs: &Arc<Mutex<Callbacks>>) {
                 }
             }
         }
+        Event::Paired { device } => {
+            if let Some((cb, udata)) = guard.packet_cb {
+                let dev_c = CString::new(device.id.to_string()).unwrap_or_default();
+                let type_c = CString::new("kdeconnect.pair").unwrap();
+                let payload = serde_json::json!({ "pair": true }).to_string();
+                let payload_c = CString::new(payload).unwrap();
+                unsafe {
+                    cb(dev_c.as_ptr(), type_c.as_ptr(), payload_c.as_ptr(), udata);
+                }
+            }
+        }
+        Event::PairingFailed { device, .. } => {
+            if let Some((cb, udata)) = guard.packet_cb {
+                let dev_c = CString::new(device.id.to_string()).unwrap_or_default();
+                let type_c = CString::new("kdeconnect.pair").unwrap();
+                let payload = serde_json::json!({ "pair": false }).to_string();
+                let payload_c = CString::new(payload).unwrap();
+                unsafe {
+                    cb(dev_c.as_ptr(), type_c.as_ptr(), payload_c.as_ptr(), udata);
+                }
+            }
+        }
         Event::SessionRequest { request, from, kind } => {
             if let Some((cb, udata)) = guard.session_cb {
                 let req_c = CString::new(request.to_string()).unwrap_or_default();
@@ -428,6 +450,30 @@ pub unsafe extern "C" fn linksy_pair_device(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn linksy_forget_device(
+    node: *mut LinksyNodeHandle,
+    device_id: *const c_char,
+) -> c_int {
+    if node.is_null() || device_id.is_null() {
+        return -1;
+    }
+    let handle = &*node;
+    let dev_id_str = match CStr::from_ptr(device_id).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let fp = match Fingerprint::from_str(dev_id_str) {
+        Ok(f) => f,
+        Err(_) => return -1,
+    };
+
+    match handle.node.forget(&fp) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn linksy_respond_pairing(
     node: *mut LinksyNodeHandle,
     request_id: *const c_char,
@@ -448,6 +494,118 @@ pub unsafe extern "C" fn linksy_respond_pairing(
 
     let ok = handle.node.respond(uuid, accept != 0);
     if ok { 0 } else { -1 }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn linksy_create_invite(
+    node: *mut LinksyNodeHandle,
+    out_uri: *mut c_char,
+    out_uri_size: libc::size_t,
+) -> c_int {
+    if node.is_null() || out_uri.is_null() || out_uri_size == 0 {
+        return -1;
+    }
+    let handle = &*node;
+    match handle.node.create_invite() {
+        Ok(invite) => {
+            let uri = invite.to_uri();
+            let c_str = match CString::new(uri) {
+                Ok(s) => s,
+                Err(_) => return -1,
+            };
+            let bytes = c_str.as_bytes_with_nul();
+            if bytes.len() > out_uri_size {
+                return -1;
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out_uri, bytes.len());
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn linksy_cancel_invite(node: *mut LinksyNodeHandle) {
+    if !node.is_null() {
+        let handle = &*node;
+        handle.node.cancel_invite();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn linksy_render_qr_svg(
+    uri: *const c_char,
+    out_svg: *mut c_char,
+    out_svg_size: libc::size_t,
+) -> c_int {
+    if uri.is_null() || out_svg.is_null() || out_svg_size == 0 {
+        return -1;
+    }
+    let uri_str = match CStr::from_ptr(uri).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let code = match qrcode::QrCode::new(uri_str.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    let width = code.width();
+    let mut path = String::new();
+    for (i, c) in code.to_colors().iter().enumerate() {
+        if *c == qrcode::Color::Dark {
+            path.push_str(&format!("M{} {}h1v1h-1z", i % width, i / width));
+        }
+    }
+    let s = width + 4;
+    let svg = format!(
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='-2 -2 {s} {s}' shape-rendering='crispEdges'><rect x='-2' y='-2' width='{s}' height='{s}' fill='white'/><path d='{path}' fill='black'/></svg>"
+    );
+    let data_url = format!("data:image/svg+xml;utf8,{}", svg.replace('#', "%23"));
+    let c_str = match CString::new(data_url) {
+        Ok(cs) => cs,
+        Err(_) => return -1,
+    };
+    let bytes = c_str.as_bytes_with_nul();
+    if bytes.len() > out_svg_size {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out_svg, bytes.len());
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn linksy_render_qr_ascii(
+    uri: *const c_char,
+    out_ascii: *mut c_char,
+    out_ascii_size: libc::size_t,
+) -> c_int {
+    if uri.is_null() || out_ascii.is_null() || out_ascii_size == 0 {
+        return -1;
+    }
+    let uri_str = match CStr::from_ptr(uri).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let code = match qrcode::QrCode::new(uri_str.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    let art = code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .dark_color(qrcode::render::unicode::Dense1x2::Light)
+        .light_color(qrcode::render::unicode::Dense1x2::Dark)
+        .quiet_zone(true)
+        .build();
+    let c_str = match CString::new(art) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let bytes = c_str.as_bytes_with_nul();
+    if bytes.len() > out_ascii_size {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, out_ascii, bytes.len());
+    0
 }
 
 #[no_mangle]

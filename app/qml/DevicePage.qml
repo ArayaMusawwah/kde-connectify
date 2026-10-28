@@ -1,7 +1,6 @@
 /*
- * SPDX-FileCopyrightText: 2015 Aleix Pol Gonzalez <aleixpol@kde.org>
- *
- * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ * SPDX-FileCopyrightText: 2026 KDE Connectify contributors
+ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only
  */
 
 import QtQuick
@@ -9,14 +8,18 @@ import QtCore
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import QtQuick.Dialogs
-import QtQml.Models
 import org.kde.kirigami as Kirigami
+import org.kde.kirigamiaddons.components as Components
 import org.kde.kdeconnect
 
 Kirigami.ScrollablePage {
     id: root
+
     property QtObject currentDevice
-    title: currentDevice.name
+    title: currentDevice ? currentDevice.name : ""
+
+    readonly property bool isPaired: currentDevice && currentDevice.isPaired
+    readonly property bool isReachable: currentDevice && currentDevice.isReachable
 
     BatteryInfo {
         id: batteryInfo
@@ -28,8 +31,7 @@ Kirigami.ScrollablePage {
         device: root.currentDevice
     }
 
-    function openSettings()
-    {
+    function openSettings() {
         for (let index = 0; index < pageStack.depth; ++index) {
             const page = pageStack.get(index);
             if (page.isPluginSettingsPage && page.device === currentDevice.id()) {
@@ -37,338 +39,229 @@ Kirigami.ScrollablePage {
                 return page;
             }
         }
-
-        return pageStack.push(
-            Qt.resolvedUrl("PluginSettings.qml"),
-            {device: currentDevice.id()}
-        );
+        return pageStack.push(Qt.resolvedUrl("PluginSettings.qml"), { device: currentDevice.id() });
     }
 
     actions: [
         Kirigami.Action {
             icon.name: "network-disconnect"
+            text: i18n("Unpair")
+            visible: root.isPaired
             onTriggered: {
-                root.currentDevice.unpair()
-                pageStack.pop(0)
-            }
-            text: i18nd("kdeconnect-app", "Unpair")
-            visible: root.currentDevice && root.currentDevice.isPaired
-        },
-        Kirigami.Action {
-            icon.name: "hands-free"
-            text: i18nd("kdeconnect-app", "Send Ping")
-            visible: root.currentDevice && root.currentDevice.isPaired && root.currentDevice.isReachable
-            onTriggered: {
-                root.currentDevice.pluginCall("ping", "sendPing");
+                root.currentDevice.unpair();
+                pageStack.pop(0);
             }
         },
         Kirigami.Action {
             icon.name: "settings-configure"
             text: i18n("Plugin Settings")
-            visible: root.currentDevice && root.currentDevice.isPaired && root.currentDevice.isReachable
-            onTriggered: {
-                root.openSettings();
-            }
+            visible: root.isPaired && root.isReachable
+            onTriggered: root.openSettings()
         }
     ]
 
-    ListView {
-        id: pluginsListView
-
-        section.property: "section"
-        section.delegate: Kirigami.ListSectionHeader {
-            width: ListView.view.width
-            text: switch (section) {
-                case "action":
-                    return i18nc("@title:group device page section header", "Actions");
-                case "control":
-                    return i18nc("@title:group device page section header", "Controls");
-                case "info":
-                    return i18nc("@title:group device page section header", "Information");
+    DropArea {
+        anchors.fill: parent
+        enabled: root.isPaired && root.isReachable
+        onDropped: drop => {
+            if (drop.hasUrls) {
+                applicationWindow().sendFiles(root.currentDevice.id(), drop.urls);
             }
         }
-        Accessible.role: Accessible.List
+    }
 
-        model: DelegateModel{
-            id: pluginModel
-            model: pluginsListView.plugins
-            groups: [
-                DelegateModelGroup {name: "loadedPlugins"}
-            ]
-            filterOnGroup: "loadedPlugins"
-            property int numberPluginsLoaded: pluginsListView.plugins.filter(plugin => !plugin.hidden && (plugin.loaded || plugin.section === "info")).length ?? 0
-            onNumberPluginsLoadedChanged: update()
+    ColumnLayout {
+        spacing: Kirigami.Units.largeSpacing * 1.5
+        width: parent.width
 
-            function update() {
-                for (let i = 0; i < items.count; ++i) {
-                    let item = items.get(i);
-                    item.inLoadedPlugins = !item.model.hidden && (item.model.loaded || (item.model.section === "info" && root.currentDevice.isPaired))
-                }
+        // 1. Device Header
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: Kirigami.Units.largeSpacing * 1.5
+
+            Components.Avatar {
+                Layout.preferredWidth: Kirigami.Units.gridUnit * 3.5
+                Layout.preferredHeight: Kirigami.Units.gridUnit * 3.5
+                name: root.title
             }
 
-            delegate: QQC2.ItemDelegate {
-                id: pluginDelegate
-                text: Kirigami.MnemonicData.richTextLabel
-                Accessible.name: Kirigami.MnemonicData.plainTextLabel ?? modelData.name // fallback needed for KF < 6.12
-                Accessible.role: modelData.clickable ? Accessible.Button : Accessible.StaticText
-                icon.name: modelData.iconName
-                highlighted: false
-                icon.color: "transparent"
-                width: pluginsListView.width
-                enabled: true
-                hoverEnabled: modelData.clickable
-                focusPolicy: modelData.clickable ? Qt.StrongFocus : Qt.NoFocus
-                onClicked: {
-                    if (modelData.clickable) {
-                        modelData.onClick()
-                    }
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 2
+                Layout.alignment: Qt.AlignVCenter
+
+                Kirigami.Heading {
+                    level: 2
+                    text: root.title
+                    elide: Text.ElideRight
                 }
 
-                Kirigami.MnemonicData.enabled: modelData.clickable && visible
-                Kirigami.MnemonicData.controlType: Kirigami.MnemonicData.MenuItem
-                Kirigami.MnemonicData.label: modelData.name
-
-                Shortcut {
-                    sequence: pluginDelegate.Kirigami.MnemonicData.sequence
-                    onActivated: clicked()
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    visible: !modelData.clickable
-                    enabled: visible
-                    acceptedButtons: Qt.AllButtons
-                    hoverEnabled: true
-                    preventStealing: true
-                }
-            }
-        }
-
-        property list<QtObject> plugins: [
-            PluginItem {
-                name: i18nd("kdeconnect-app", "Multimedia control")
-                interfaceFactory: MprisDbusInterfaceFactory
-                component: "mpris.qml"
-                pluginName: "mprisremote"
-                section: "control"
-                device: root.currentDevice
-            },
-            PluginItem {
-                name: i18nd("kdeconnect-app", "Notifications")
-                interfaceFactory: DeviceNotificationsDbusInterfaceFactory
-                component: "NotificationPanel.qml"
-                pluginName: "notifications"
-                section: "control"
-                device: root.currentDevice
-            },
-            PluginItem {
-                name: i18nd("kdeconnect-app", "Remote input")
-                interfaceFactory: RemoteControlDbusInterfaceFactory
-                component: "mousepad.qml"
-                pluginName: "remotecontrol"
-                section: "control"
-                device: root.currentDevice
-            },
-            PluginItem {
-                name: i18nd("kdeconnect-app", "Run command")
-                interfaceFactory: RemoteCommandsDbusInterfaceFactory
-                component: "runcommand.qml"
-                pluginName: "remotecommands"
-                section: "control"
-                device: root.currentDevice
-            },
-            PluginItem {
-                name: i18nd("kdeconnect-app", "Presentation Remote")
-                interfaceFactory: RemoteKeyboardDbusInterfaceFactory
-                component: "presentationRemote.qml"
-                pluginName: "remotecontrol"
-                section: "control"
-                device: root.currentDevice
-                hidden: root.currentDevice.type === "phone" || root.currentDevice.type === "tablet"
-            },
-            PluginItem {
-                name: i18nd("kdeconnect-app", "Volume control")
-                interfaceFactory: RemoteSystemVolumeDbusInterfaceFactory
-                component: "volume.qml"
-                pluginName: "remotesystemvolume"
-                section: "control"
-                device: root.currentDevice
-            },
-            PluginItem {
-                readonly property QtObject sms: SmsDbusInterfaceFactory.create(root.currentDevice.id())
-                pluginName: "sms"
-                name: i18n("SMS Messages")
-                onClick: () => sms.launchApp();
-                section: "control"
-                device: root.currentDevice
-            },
-            PluginItem {
-                readonly property var lockIface: LockDeviceDbusInterfaceFactory.create(root.currentDevice.id())
-                pluginName: "lockdevice"
-                name: lockIface.isLocked ? i18nd("kdeconnect-app", "Unlock") : i18nd("kdeconnect-app", "Lock")
-                onClick: () => lockIface.isLocked = !lockIface.isLocked;
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                readonly property var findmyphoneIface: FindMyPhoneDbusInterfaceFactory.create(root.currentDevice.id())
-                pluginName: "findmyphone"
-                name: i18nd("kdeconnect-app", "Find Device")
-                section: "action"
-                onClick: () => findmyphoneIface.ring()
-                device: root.currentDevice
-            },
-            PluginItem {
-                readonly property var clipboardIface: ClipboardDbusInterfaceFactory.create(root.currentDevice.id())
-                pluginName: "clipboard"
-                name: i18nd("kdeconnect-app", "Send Clipboard")
-                onClick: () => clipboardIface.sendClipboard()
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "share"
-                name: i18nd("kdeconnect-app", "Share File")
-                onClick: () => fileDialog.open()
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                readonly property QtObject sftp: SftpDbusInterfaceFactory.create(root.currentDevice.id())
-                pluginName: "sftp"
-                name: i18n("Browse this device")
-                onClick: () => sftp.startBrowsing();
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                readonly property QtObject virtualMonitor: VirtualmonitorDbusInterfaceFactory.create(root.currentDevice.id())
-                pluginName: "virtualmonitor"
-                name: virtualMonitor.active ? i18n("Stop virtual monitor session") : i18n("Use device as an external monitor")
-                onClick: () => {
-                    if (virtualMonitor.active) {
-                        virtualMonitor.stop();
-                    } else {
-                        virtualMonitor.requestVirtualMonitor();
-                        if (virtualMonitor.lastError.length > 0) {
-                            showPassiveNotification(virtualMonitor.lastError)
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    opacity: 0.75
+                    text: {
+                        let parts = [];
+                        if (root.currentDevice) {
+                            parts.push(root.currentDevice.type);
+                            parts.push(root.isReachable ? i18n("Connected") : i18n("Offline"));
+                            if (batteryInfo.hasBattery) parts.push(batteryInfo.displayString);
+                            if (connectivityInfo.available) parts.push(connectivityInfo.displayString);
                         }
+                        return parts.join(" • ");
                     }
                 }
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "sidecar"
-                name: i18n("Second Display (Sidecar)")
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "webcam"
-                name: i18n("Virtual Webcam")
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "microphone"
-                name: i18n("Virtual Microphone")
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "screenmirror"
-                name: i18n("Screen Mirror & Control")
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "terminal"
-                name: i18n("Remote Terminal Shell")
-                section: "action"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "battery"
-                name: batteryInfo.displayString
-                iconNameOverride: batteryInfo.iconName
-                hidden: !batteryInfo.hasBattery
-                section: "info"
-                device: root.currentDevice
-            },
-            PluginItem {
-                pluginName: "connectivity_report"
-                name: connectivityInfo.displayString
-                iconNameOverride: connectivityInfo.iconName
-                hidden: !connectivityInfo.available
-                section: "info"
-                device: root.currentDevice
-            },
-            PluginItem {
-                name: i18nd("kdeconnect-app", "Address: %1 via %2", root.currentDevice.reachableAddresses, root.currentDevice.activeProviderNames)
-                hidden: !root.currentDevice.isReachable
-                section: "info"
-                device: root.currentDevice
             }
-        ]
+        }
 
-        Kirigami.PlaceholderMessage {
-            // FIXME: not accessible. screen readers won't read this. Idem for the other PlaceholderMessages
-            //        https://invent.kde.org/frameworks/kirigami/-/merge_requests/1482
-            text: i18nd("kdeconnect-app", "This device is not paired.")
-            anchors.centerIn: parent
-            visible: root.currentDevice && root.currentDevice.isReachable && !root.currentDevice.isPaired && !root.currentDevice.isPairRequestedByPeer && !root.currentDevice.isPairRequested
-            helpfulAction: Kirigami.Action {
-                text: i18ndc("kdeconnect-app", "Request pairing with a given device", "Pair")
-                icon.name:"network-connect"
+        // 2. Pairing Banner (if reachable but not paired)
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: root.isReachable && !root.isPaired
+            type: Kirigami.MessageType.Information
+            text: i18n("Pair with this device to access files, media controls, and hardware features.")
+            actions: Kirigami.Action {
+                text: i18n("Pair")
+                icon.name: "network-connect"
                 onTriggered: root.currentDevice.requestPairing()
             }
         }
 
-        Kirigami.PlaceholderMessage {
-            text: i18nd("kdeconnect-app", "Pair requested\nKey: " + root.currentDevice.verificationKey)
-            anchors.centerIn: parent
-            visible: root.currentDevice && root.currentDevice.isReachable && root.currentDevice.isPairRequested
-            QQC2.BusyIndicator {
-                Layout.alignment: Qt.AlignHCenter
-            }
-        }
-
-        Kirigami.PlaceholderMessage {
-            text: i18n("Pair requested\nKey: " + root.currentDevice.verificationKey)
-            visible: root.currentDevice && root.currentDevice.isPairRequestedByPeer
-            anchors.centerIn: parent
+        // 3. Quick Action Tiles Grid
+        Flow {
+            Layout.fillWidth: true
             spacing: Kirigami.Units.largeSpacing
-            RowLayout {
-                QQC2.Button {
-                    text: i18nd("kdeconnect-app", "Accept")
-                    icon.name:"dialog-ok"
-                    onClicked: root.currentDevice.acceptPairing()
-                }
+            visible: root.isPaired && root.isReachable
 
-                QQC2.Button {
-                    text: i18nd("kdeconnect-app", "Reject")
-                    icon.name:"dialog-cancel"
-                    onClicked: root.currentDevice.cancelPairing()
+            ActionTile {
+                iconName: "system-file-manager"
+                title: i18n("Browse Files")
+                subtitle: i18n("Open in Dolphin")
+                onClicked: {
+                    let sftp = SftpDbusInterfaceFactory.create(root.currentDevice.id());
+                    if (sftp) sftp.startBrowsing();
+                    else Qt.openUrlExternally("kdeconnect://" + root.currentDevice.id() + "/");
                 }
+            }
+
+            ActionTile {
+                iconName: "document-send"
+                title: i18n("Send Files")
+                subtitle: i18n("Choose files to send")
+                onClicked: deviceFileDialog.open()
+            }
+
+            ActionTile {
+                iconName: "edit-paste"
+                title: i18n("Send Clipboard")
+                subtitle: i18n("Push clipboard to phone")
+                onClicked: {
+                    let clip = ClipboardDbusInterfaceFactory.create(root.currentDevice.id());
+                    clip.sendClipboard();
+                    applicationWindow().showPassiveNotification(i18n("Clipboard sent to %1", root.title));
+                }
+            }
+
+            ActionTile {
+                iconName: "audio-volume-high"
+                title: i18n("Find Phone")
+                subtitle: i18n("Ring device to locate it")
+                onClicked: {
+                    let finder = FindMyPhoneDbusInterfaceFactory.create(root.currentDevice.id());
+                    finder.ring();
+                }
+            }
+
+            ActionTile {
+                iconName: "preferences-desktop-notification-bell"
+                title: i18n("Send Ping")
+                subtitle: i18n("Test notification")
+                onClicked: root.currentDevice.pluginCall("ping", "sendPing")
+            }
+
+            ActionTile {
+                iconName: "video-display"
+                title: i18n("Screen Mirror")
+                subtitle: i18n("View mobile screen")
+                onClicked: root.currentDevice.pluginCall("screenmirror", "startMirror")
             }
         }
 
-        Kirigami.PlaceholderMessage {
-            // FIXME: not accessible. screen readers won't read this.
-            //        https://invent.kde.org/frameworks/kirigami/-/merge_requests/1482
-            visible: root.currentDevice && !root.currentDevice.isReachable
-            text: i18nd("kdeconnect-app", "This device is not reachable")
-            anchors.centerIn: parent
+        // 4. Remote Media Player Card
+        MprisCard {
+            Layout.fillWidth: true
+            device: root.currentDevice
+            visible: root.isPaired && root.isReachable
+        }
+
+        // 5. Remote Storage & SFTP Card
+        StorageCard {
+            Layout.fillWidth: true
+            device: root.currentDevice
+            visible: root.isPaired && root.isReachable
+        }
+
+        // 6. Linksy Hardware Hub
+        HardwareHub {
+            Layout.fillWidth: true
+            device: root.currentDevice
+            visible: root.isPaired && root.isReachable
+        }
+
+        // 7. Remote Tools Bar
+        Kirigami.Heading {
+            level: 3
+            text: i18n("Tools & Input")
+            visible: root.isPaired && root.isReachable
+        }
+
+        Flow {
+            Layout.fillWidth: true
+            spacing: Kirigami.Units.smallSpacing
+            visible: root.isPaired && root.isReachable
+
+            QQC2.Button {
+                icon.name: "input-mouse"
+                text: i18n("Virtual Trackpad")
+                onClicked: pageStack.push(Qt.resolvedUrl("mousepad.qml"), {
+                    pluginInterface: RemoteControlDbusInterfaceFactory.create(root.currentDevice.id()),
+                    device: root.currentDevice
+                })
+            }
+
+            QQC2.Button {
+                icon.name: "preferences-desktop-notification-bell"
+                text: i18n("Notification Mirror")
+                onClicked: pageStack.push(Qt.resolvedUrl("NotificationPanel.qml"), {
+                    pluginInterface: DeviceNotificationsDbusInterfaceFactory.create(root.currentDevice.id()),
+                    device: root.currentDevice
+                })
+            }
+
+            QQC2.Button {
+                icon.name: "message-new"
+                text: i18n("SMS Messages")
+                onClicked: {
+                    let sms = SmsDbusInterfaceFactory.create(root.currentDevice.id());
+                    sms.launchApp();
+                }
+            }
+
+            QQC2.Button {
+                icon.name: "system-run"
+                text: i18n("Run Commands")
+                onClicked: pageStack.push(Qt.resolvedUrl("runcommand.qml"), {
+                    pluginInterface: RemoteCommandsDbusInterfaceFactory.create(root.currentDevice.id()),
+                    device: root.currentDevice
+                })
+            }
         }
     }
 
     FileDialog {
-        id: fileDialog
-        readonly property var shareIface: root.currentDevice ? ShareDbusInterfaceFactory.create(root.currentDevice.id()) : null
-        title: i18nd("kdeconnect-app", "Please choose a file")
-        currentFolder: StandardPaths.standardLocations(StandardPaths.HomeLocation)[0]
+        id: deviceFileDialog
+        title: i18n("Choose Files to Send")
         fileMode: FileDialog.OpenFiles
-        onAccepted: shareIface.shareUrls(fileDialog.selectedFiles)
+        onAccepted: applicationWindow().sendFiles(root.currentDevice.id(), selectedFiles)
     }
 }

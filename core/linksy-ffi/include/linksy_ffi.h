@@ -48,7 +48,12 @@ int linksy_set_media_data_callback(LinksyNodeHandle *node, linksy_media_data_cb 
 
 /* Pairing & messaging */
 int linksy_pair_device(LinksyNodeHandle *node, const char *device_id);
+int linksy_forget_device(LinksyNodeHandle *node, const char *device_id);
 int linksy_respond_pairing(LinksyNodeHandle *node, const char *request_id, int accept);
+int linksy_create_invite(LinksyNodeHandle *node, char *out_uri, size_t out_uri_size);
+void linksy_cancel_invite(LinksyNodeHandle *node);
+int linksy_render_qr_ascii(const char *uri, char *out_ascii, size_t out_ascii_size);
+int linksy_render_qr_svg(const char *uri, char *out_svg, size_t out_svg_size);
 int linksy_send_packet(LinksyNodeHandle *node, const char *device_id, const char *packet_type, const char *payload_json);
 
 /* Sessions & media */

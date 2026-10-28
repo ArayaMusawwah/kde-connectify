@@ -40,3 +40,4 @@ smsapp/resources.generated.qrc
 /3rdparty/linksy-desktop/target/
 /core/linksy-ffi/target/
 /.superpowers/
+/.mimocode/

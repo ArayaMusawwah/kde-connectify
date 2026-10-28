@@ -118,7 +118,13 @@ int main(int argc, char *argv[])
         flags |= KDBusService::Replace;
     }
     KDBusService dbusService(flags);
+    qputenv("QML_IMPORT_PATH", QCoreApplication::applicationDirPath().toUtf8());
+    qputenv("QML2_IMPORT_PATH", QCoreApplication::applicationDirPath().toUtf8());
+
     QQmlApplicationEngine engine;
+    QStringList importPaths = engine.importPathList();
+    importPaths.prepend(QCoreApplication::applicationDirPath());
+    engine.setImportPathList(importPaths);
     KLocalization::setupLocalizedContext(&engine);
     QObject::connect(&engine, &QQmlApplicationEngine::warnings, &app, [](const QList<QQmlError> &warnings) {
         for (const auto &err : warnings) {

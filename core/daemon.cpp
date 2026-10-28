@@ -376,4 +376,35 @@ QString Daemon::selfId() const
     return KdeConnectConfig::instance().deviceId();
 }
 
+QString Daemon::createPairingInvite()
+{
+    if (auto *provider = LinksyLinkProvider::instance()) {
+        return provider->createInvite();
+    }
+    return QString();
+}
+
+QString Daemon::renderPairingQr(const QString &uri)
+{
+    if (auto *provider = LinksyLinkProvider::instance()) {
+        return provider->renderQrAscii(uri);
+    }
+    return QString();
+}
+
+QString Daemon::renderPairingQrSvg(const QString &uri)
+{
+    if (auto *provider = LinksyLinkProvider::instance()) {
+        return provider->renderQrSvg(uri);
+    }
+    return QString();
+}
+
+void Daemon::cancelPairingInvite()
+{
+    if (auto *provider = LinksyLinkProvider::instance()) {
+        provider->cancelInvite();
+    }
+}
+
 #include "moc_daemon.cpp"

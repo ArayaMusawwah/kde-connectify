@@ -239,10 +239,51 @@ void LinksyLinkProvider::handlePairingRequest(const QString &requestId, const QS
 {
     Q_UNUSED(incoming);
     qCDebug(KDECONNECT_CORE) << "Linksy pairing request:" << requestId << "device:" << deviceId << "code:" << code;
-    // Auto-accept if already trusted in KDE Connect config, or prompt
-    if (KdeConnectConfig::instance().trustedDevices().contains(deviceId)) {
-        linksy_respond_pairing(m_node, requestId.toUtf8().constData(), 1);
+    // Accept pairing request to establish trust
+    linksy_respond_pairing(m_node, requestId.toUtf8().constData(), 1);
+}
+
+QString LinksyLinkProvider::createInvite()
+{
+    if (!m_node) {
+        return QString();
     }
+    char buf[1024] = {0};
+    if (linksy_create_invite(m_node, buf, sizeof(buf)) == 0) {
+        return QString::fromUtf8(buf);
+    }
+    return QString();
+}
+
+void LinksyLinkProvider::cancelInvite()
+{
+    if (m_node) {
+        linksy_cancel_invite(m_node);
+    }
+}
+
+QString LinksyLinkProvider::renderQrSvg(const QString &uri)
+{
+    if (uri.isEmpty()) {
+        return QString();
+    }
+    char buf[65536] = {0};
+    if (linksy_render_qr_svg(uri.toUtf8().constData(), buf, sizeof(buf)) == 0) {
+        return QString::fromUtf8(buf);
+    }
+    return QString();
+}
+
+QString LinksyLinkProvider::renderQrAscii(const QString &uri)
+{
+    if (uri.isEmpty()) {
+        return QString();
+    }
+    char buf[16384] = {0};
+    if (linksy_render_qr_ascii(uri.toUtf8().constData(), buf, sizeof(buf)) == 0) {
+        return QString::fromUtf8(buf);
+    }
+    return QString();
 }
 
 void LinksyLinkProvider::handlePacketReceived(const QString &deviceId, const QString &type, const QString &payload)
@@ -253,6 +294,13 @@ void LinksyLinkProvider::handlePacketReceived(const QString &deviceId, const QSt
 
     const QJsonDocument doc = QJsonDocument::fromJson(payload.toUtf8());
     const QJsonObject obj = doc.isObject() ? doc.object() : QJsonObject();
+
+    if (type == QLatin1String("kdeconnect.pair")) {
+        NetworkPacket np(QStringLiteral("kdeconnect.pair"));
+        np.set(QStringLiteral("pair"), obj.value(QStringLiteral("pair")).toBool());
+        link->injectPacket(np);
+        return;
+    }
 
     if (type == QLatin1String("clipboard")) {
         NetworkPacket np(QStringLiteral("kdeconnect.clipboard"));

@@ -18,6 +18,61 @@ Kirigami.ApplicationWindow {
     property string pendingDeviceId
     property string pendingPluginConfig
 
+    property var transfers: []
+    property int activeTransfersCount: {
+        let count = 0;
+        for (let i = 0; i < transfers.length; ++i) {
+            if (transfers[i].status === "in_progress") count++;
+        }
+        return count;
+    }
+    property real transfersFraction: {
+        let active = 0;
+        let sum = 0;
+        for (let i = 0; i < transfers.length; ++i) {
+            if (transfers[i].status === "in_progress") {
+                active++;
+                sum += (transfers[i].progress || 0);
+            }
+        }
+        return active > 0 ? (sum / active) : 0;
+    }
+
+    function sendFiles(deviceId, fileUrls) {
+        let shareIface = ShareDbusInterfaceFactory.create(deviceId);
+        let list = [];
+        for (let i = 0; i < fileUrls.length; ++i) {
+            let u = fileUrls[i].toString();
+            list.push(u);
+            let fname = u.substring(u.lastIndexOf('/') + 1);
+            transfers.push({
+                id: "tx_" + Date.now() + "_" + i,
+                fileName: fname,
+                peerName: devicesModel.deviceForId(deviceId) ? devicesModel.deviceForId(deviceId).name : deviceId,
+                status: "in_progress",
+                progress: 1.0
+            });
+        }
+        transfersChanged();
+        for (let i = 0; i < list.length; ++i) {
+            shareIface.shareUrl(list[i]);
+        }
+        showPassiveNotification(i18n("Sending %1 file(s)...", fileUrls.length));
+    }
+
+    function clearCompletedTransfers() {
+        transfers = [];
+        transfersChanged();
+    }
+
+    function toggleCornerPanel() {
+        cornerPanel.visible = !cornerPanel.visible;
+    }
+
+    function openInviteDialog() {
+        inviteDialog.open();
+    }
+
     minimumWidth: Kirigami.Units.gridUnit * 15
     minimumHeight: Kirigami.Units.gridUnit * 15
     wideScreen: width > columnWidth * 5
@@ -217,9 +272,9 @@ Kirigami.ApplicationWindow {
                 }
             }
 
-            Item {
-                Layout.fillHeight: true
+            Island {
                 Layout.fillWidth: true
+                Layout.margins: Kirigami.Units.smallSpacing
             }
 
             QQC2.ToolBar {
@@ -277,6 +332,15 @@ Kirigami.ApplicationWindow {
         if (pageStack.currentIndex) {
             pageStack.removePage(pageStack.currentIndex)
         }
+    }
+
+    InviteDialog {
+        id: inviteDialog
+    }
+
+    CornerPanel {
+        id: cornerPanel
+        parent: root.overlay
     }
 
     Component.onCompleted: devices.forceActiveFocus()

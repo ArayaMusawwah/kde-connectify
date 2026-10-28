@@ -78,6 +78,8 @@ int main(int argc, char **argv)
                                         i18n("Make --list-devices or --list-available print only the devices id and name, to ease scripting")));
     parser.addOption(QCommandLineOption(QStringLiteral("refresh"), i18n("Search for devices in the network and re-establish connections")));
     parser.addOption(QCommandLineOption(QStringLiteral("pair"), i18n("Request pairing with device")));
+    parser.addOption(
+        QCommandLineOption(QStringList{QStringLiteral("pair-qr"), QStringLiteral("invite")}, i18n("Show a QR code to pair with Android / mobile device")));
     parser.addOption(QCommandLineOption(QStringLiteral("ring"), i18n("Find device by ringing it")));
     parser.addOption(QCommandLineOption(QStringLiteral("unpair"), i18n("Unpair from device")));
     parser.addOption(QCommandLineOption(QStringLiteral("ping"), i18n("Send ping to device")));
@@ -123,6 +125,41 @@ int main(int argc, char **argv)
 
     if (parser.isSet(QStringLiteral("my-id"))) {
         QTextStream(stdout) << iface.selfId() << Qt::endl;
+    } else if (parser.isSet(QStringLiteral("pair-qr"))) {
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
+                                                          QStringLiteral("/modules/kdeconnect"),
+                                                          QStringLiteral("org.kde.kdeconnect.daemon"),
+                                                          QStringLiteral("createPairingInvite"));
+        QString uri = blockOnReply<QString>(QDBusConnection::sessionBus().call(msg));
+        if (uri.isEmpty()) {
+            QTextStream(stderr) << i18n("Failed to generate pairing invite. Ensure kdeconnectd is running.") << Qt::endl;
+            return 1;
+        }
+
+        QDBusMessage qrMsg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
+                                                            QStringLiteral("/modules/kdeconnect"),
+                                                            QStringLiteral("org.kde.kdeconnect.daemon"),
+                                                            QStringLiteral("renderPairingQr"));
+        qrMsg.setArguments({uri});
+        QString qrAscii = blockOnReply<QString>(QDBusConnection::sessionBus().call(qrMsg));
+
+        QTextStream out(stdout);
+        if (!qrAscii.isEmpty()) {
+            out << qrAscii << Qt::endl;
+        }
+
+        out << Qt::endl;
+        out << i18n("Scan this QR code with KDE Connectify on your phone (Add Device -> Scan QR Code).") << Qt::endl;
+        out << i18n("Pairing Link: ") << uri << Qt::endl;
+        out << i18n("Waiting for device to connect (valid for 5 minutes). Press Ctrl+C to cancel...") << Qt::endl;
+
+        QObject::connect(&iface, &DaemonDbusInterface::deviceAdded, &app, [&app](const QString &id) {
+            DeviceDbusInterface dev(id);
+            QTextStream(stdout) << i18n("Paired successfully with: ") << dev.name() << " (" << id << ")" << Qt::endl;
+            app.quit();
+        });
+
+        return app.exec();
     } else if (parser.isSet(QStringLiteral("l")) || parser.isSet(QStringLiteral("a"))) {
         bool available = false;
         if (parser.isSet(QStringLiteral("a"))) {
@@ -206,7 +243,7 @@ int main(int argc, char **argv)
         // Exit with 1 if we didn't find a device
         return int(devices.isEmpty());
     } else if (parser.isSet(QStringLiteral("refresh"))) {
-        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                           QStringLiteral("/modules/kdeconnect"),
                                                           QStringLiteral("org.kde.kdeconnect.daemon"),
                                                           QStringLiteral("forceOnNetworkChange"));
@@ -236,7 +273,7 @@ int main(int argc, char **argv)
             urls.append(url.toString());
         }
 
-        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                           QLatin1String("/modules/kdeconnect/devices/%1/share").arg(device),
                                                           QStringLiteral("org.kde.kdeconnect.device.share"),
                                                           QStringLiteral("shareUrls"));
@@ -252,7 +289,7 @@ int main(int argc, char **argv)
         if (device.isEmpty())
             return 1;
 
-        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                           QLatin1String("/modules/kdeconnect/devices/%1/share").arg(device),
                                                           QStringLiteral("org.kde.kdeconnect.device.share"),
                                                           QStringLiteral("shareText"));
@@ -319,7 +356,7 @@ int main(int argc, char **argv)
         if (device.isEmpty())
             return 1;
 
-        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                           QLatin1String("/modules/kdeconnect/devices/%1/clipboard").arg(device),
                                                           QStringLiteral("org.kde.kdeconnect.device.clipboard"),
                                                           QStringLiteral("sendClipboard"));
@@ -329,7 +366,7 @@ int main(int argc, char **argv)
         if (device.isEmpty())
             return 1;
 
-        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                           QLatin1String("/modules/kdeconnect/devices/%1/ping").arg(device),
                                                           QStringLiteral("org.kde.kdeconnect.device.ping"),
                                                           QStringLiteral("sendPing"));
@@ -377,7 +414,7 @@ int main(int argc, char **argv)
         if (device.isEmpty())
             return 1;
 
-        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                           QLatin1String("/modules/kdeconnect/devices/%1/findmyphone").arg(device),
                                                           QStringLiteral("org.kde.kdeconnect.device.findmyphone"),
                                                           QStringLiteral("ring"));
@@ -388,7 +425,7 @@ int main(int argc, char **argv)
             return 1;
 
         QString seq = parser.value(QStringLiteral("send-keys"));
-        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                           QLatin1String("/modules/kdeconnect/devices/%1/remotekeyboard").arg(device),
                                                           QStringLiteral("org.kde.kdeconnect.device.remotekeyboard"),
                                                           QStringLiteral("sendKeyPress"));
@@ -452,7 +489,7 @@ int main(int argc, char **argv)
         if (device.isEmpty())
             return 1;
 
-        QDBusMessage msgBrowse = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msgBrowse = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                                 QLatin1String("/modules/kdeconnect/devices/%1/sftp").arg(device),
                                                                 QStringLiteral("org.kde.kdeconnect.device.sftp"),
                                                                 QStringLiteral("startBrowsing"));
@@ -463,7 +500,7 @@ int main(int argc, char **argv)
         if (device.isEmpty())
             return 1;
 
-        QDBusMessage msgMount = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msgMount = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                                QLatin1String("/modules/kdeconnect/devices/%1/sftp").arg(device),
                                                                QStringLiteral("org.kde.kdeconnect.device.sftp"),
                                                                QStringLiteral("mountAndWait"));
@@ -473,7 +510,7 @@ int main(int argc, char **argv)
         if (device.isEmpty())
             return 1;
 
-        QDBusMessage msgMountPoint = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnect"),
+        QDBusMessage msgMountPoint = QDBusMessage::createMethodCall(QStringLiteral("org.kde.kdeconnectify"),
                                                                     QLatin1String("/modules/kdeconnect/devices/%1/sftp").arg(device),
                                                                     QStringLiteral("org.kde.kdeconnect.device.sftp"),
                                                                     QStringLiteral("mountPoint"));

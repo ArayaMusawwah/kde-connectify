@@ -50,6 +50,12 @@ public:
         return m_node;
     }
 
+    // Pairing & Invites
+    QString createInvite();
+    void cancelInvite();
+    QString renderQrAscii(const QString &uri);
+    QString renderQrSvg(const QString &uri);
+
     // Media & Hardware Plugin API
     int requestSession(const QString &deviceId, int sessionKind, QString &outSessionId);
     int respondSession(const QString &requestId, bool accept, uint32_t width = 0, uint32_t height = 0);

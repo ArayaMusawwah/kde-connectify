@@ -46,6 +46,13 @@ ecm_target_qml_sources(kdeconnect-app SOURCES
     qml/Settings.qml
     qml/WelcomePage.qml
     qml/NotificationPanel.qml
+    qml/ActionTile.qml
+    qml/MprisCard.qml
+    qml/StorageCard.qml
+    qml/HardwareHub.qml
+    qml/InviteDialog.qml
+    qml/Island.qml
+    qml/CornerPanel.qml
 )
 
 target_link_libraries(kdeconnect-app PRIVATE

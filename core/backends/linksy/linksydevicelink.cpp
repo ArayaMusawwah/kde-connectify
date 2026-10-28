@@ -31,6 +31,15 @@ bool LinksyDeviceLink::sendPacket(NetworkPacket &np)
     const QByteArray devIdBytes = m_deviceInfo.id.toUtf8();
     const QString type = np.type();
 
+    if (type == QLatin1String("kdeconnect.pair")) {
+        const bool pair = np.get<bool>(QStringLiteral("pair"), true);
+        if (pair) {
+            return linksy_pair_device(m_node, devIdBytes.constData()) == 0;
+        } else {
+            return linksy_forget_device(m_node, devIdBytes.constData()) == 0;
+        }
+    }
+
     if (type == QLatin1String("kdeconnect.clipboard") || type == QLatin1String("kdeconnect.clipboard.connect")) {
         const QString text = np.get<QString>(QStringLiteral("content"), QString());
         QJsonObject root;

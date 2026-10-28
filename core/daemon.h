@@ -71,6 +71,12 @@ public Q_SLOTS:
     /// Set the state of a link provider.
     Q_SCRIPTABLE void setLinkProviderState(const QString &linkProvider, bool enabled);
 
+    /// Pairing invites via Linksy QUIC
+    Q_SCRIPTABLE QString createPairingInvite();
+    Q_SCRIPTABLE QString renderPairingQr(const QString &uri);
+    Q_SCRIPTABLE QString renderPairingQrSvg(const QString &uri);
+    Q_SCRIPTABLE void cancelPairingInvite();
+
     Q_SCRIPTABLE virtual void sendSimpleNotification(const QString &eventId, const QString &title, const QString &text, const QString &iconName) = 0;
 
 Q_SIGNALS:
