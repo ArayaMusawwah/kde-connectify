@@ -1,0 +1,933 @@
+//! Development aid: act as a phone toward paired computers, to try phone features without
+//! a real phone. Reuses a device identity (its data dir), reports itself as a
+//! phone, sends its battery and a notification to every paired device, and prints what
+//! it's asked to do.
+//!
+//! cargo run -p linksy-core --example fake_phone -- --data-dir DIR [--port N] [--name NAME]
+//!     [--battery PERCENT] [--charging] [--notify "TITLE" "BODY"] [--display FILE]
+//!     [--media "TITLE" "ARTIST"] [--watch-media] [--call SECONDS] [--leave-after SECONDS]
+//!     [--import PATH] [--touchpad] [--files DIR] [--no-discovery] [--seconds N]
+//!
+//! `--accept-pairing` says yes to pairing, for scripted tests. `--connect HOST:PORT`
+//! connects to a computer by address (no discovery needed).
+//! It always answers texting requests from a small made-up inbox. `--files DIR` shares
+//! that folder as the phone's storage (for "Browse Files" and the Files tab: reads, writes,
+//! new folders, renames and deletes, nothing above DIR).
+//!
+//! `--display FILE` accepts "Use as Second Display" and saves the H.264 it receives.
+//! `--media "TITLE" "ARTIST"` plays a song (as far as the computer can tell);
+//! `--watch-media` prints what the computer plays; `--press play-pause|next|previous`
+//! presses that button on the first player it hears about. `--call SECONDS` rings, answers
+//! two seconds later, and hangs up after that many seconds. It checks in when a computer
+//! asks (lock when away); `--leave-after SECONDS` stops that, as if it walked away.
+//! `--import PATH` imports photos (a file or folder) into the computer's pictures.
+//! `--touchpad` asks to be the computer's touchpad and keyboard, then moves, clicks, types
+//! "hello" and presses Right (next slide).
+//! `--view-screen FILE` asks to see the computer's screen and saves 4 s of its H.264.
+//! `--clip-file PATH` puts a file (an image…) on the computer's clipboard, `--clip TEXT`
+//! some text.
+//! `--watch-clipboard` asks for the computer's clipboard as it changes and prints it.
+//! `--camera` accepts "Use as Webcam": streams a test picture (with gst-launch-1.0, when
+//! it's there), sends a `camera_state` and prints the `camera_control` it gets.
+//! `--mic` accepts "Use as Microphone": sends a 440 Hz tone that swells and fades like
+//! speech, the way the phone sends its microphone (raw PCM, s16le, 48 kHz, mono, 10 ms at a
+//! time).
+//! `--picture FILE` sends that JPEG or PNG as the phone's picture.
+//! `--location LAT,LON` answers "Locate" with that position (else it says no).
+//! `--away` turns on away from home, through LINKSY_RELAY or Linksy's relay.
+//! `--terminal CODE` opens a terminal on the computer, types `--type TEXT` (default
+//! `echo linksy-$((6*7))`) and prints what comes back for 3 s, then detaches.
+//! `--resume` reattaches the first terminal `terminal_list` gives instead, and
+//! `--close` ends it after; `--watch-terminal SECONDS` watches longer than 3 s (it stops
+//! early when the computer ends the terminal).
+//! `--notifications-later SECONDS` starts without `notifications` and announces it after
+//! that long, as when the user turns the listener on.
+//! `--gallery DIR` shows the photos and videos under DIR as its gallery: a folder is an
+//! album, a file's modification time is when it was taken, a JPEG or PNG up to 256 KiB is
+//! its own thumbnail. Adding or removing a file there sends `gallery_changed`.
+//! `--deck ACTION[=VALUE]` opens the deck, prints the `deck_actions` and `deck_state` it
+//! gets, runs that action (a slider with VALUE), prints the state after, then closes it.
+//! `--deck-layout` announces `deck_layout`, so the deck also gets its layouts (printed as
+//! DECK_LAYOUT, in short); `--deck-wait SECONDS` keeps the deck open that long after the run.
+//! `--off FEATURE` starts without it (`notifications`, `gallery`), as with its switch off;
+//! `--turn-on` announces `turn_on` and says yes when a computer asks to turn one on.
+
+use std::time::Duration;
+
+use linksy_core::{Battery, Config, DeviceKind, Event, MediaPlayer, MediaState, Node, NotificationButton, RemoteNotification};
+
+#[tokio::main]
+async fn main() {
+    let mut args = std::env::args().skip(1);
+    let (mut data_dir, mut port, mut name) = (None, 0, "Test Phone".to_string());
+    let (mut level, mut charging, mut seconds) = (None, false, 60);
+    let mut notify = None;
+    let mut chats = false;
+    let mut notifications_later: Option<u64> = None;
+    let mut display: Option<std::path::PathBuf> = None;
+    let (mut media, mut watch_media) = (None, false);
+    let mut press: Option<linksy_core::MediaCommand> = None;
+    let mut call: Option<u64> = None;
+    let mut leave_after: Option<u64> = None;
+    let mut import: Option<std::path::PathBuf> = None;
+    let mut touchpad = false;
+    let mut view_screen: Option<std::path::PathBuf> = None;
+    let mut connect: Option<std::net::SocketAddr> = None;
+    let mut no_discovery = false;
+    let mut files: Option<std::path::PathBuf> = None;
+    let mut gallery: Option<std::path::PathBuf> = None;
+    let mut clip_file: Option<std::path::PathBuf> = None;
+    let mut clip_text: Option<String> = None;
+    let mut terminal: Option<String> = None;
+    let mut typed = "echo linksy-$((6*7))".to_string();
+    let (mut resume, mut close, mut watch_for) = (false, false, 3u64);
+    let mut watch_clipboard = false;
+    let mut camera = false;
+    let mut mic = false;
+    let mut picture: Option<std::path::PathBuf> = None;
+    let mut location: Option<(f64, f64)> = None;
+    let mut away = false;
+    let mut accept_pairing = false;
+    let mut deck: Option<(String, Option<f64>)> = None;
+    let (mut deck_layout, mut deck_wait) = (false, 0u64);
+    let (mut off, mut turn_on) = (Vec::<String>::new(), false);
+    while let Some(a) = args.next() {
+        let mut value = || args.next().expect("option needs a value");
+        match a.as_str() {
+            "--data-dir" => data_dir = Some(value()),
+            "--port" => port = value().parse().expect("--port N"),
+            "--name" => name = value(),
+            "--no-discovery" => no_discovery = true,
+            "--connect" => connect = Some(value().parse().expect("--connect HOST:PORT")),
+            "--accept-pairing" => accept_pairing = true,
+            "--battery" => level = Some(value().parse::<u8>().expect("--battery PERCENT")),
+            "--charging" => charging = true,
+            "--seconds" => seconds = value().parse().expect("--seconds N"),
+            "--display" => display = Some(value().into()),
+            "--watch-media" => watch_media = true,
+            "--call" => call = Some(value().parse().expect("--call SECONDS")),
+            "--import" => import = Some(value().into()),
+            "--touchpad" => touchpad = true,
+            "--view-screen" => view_screen = Some(value().into()),
+            "--clip-file" => clip_file = Some(value().into()),
+            "--clip" => clip_text = Some(value()),
+            "--terminal" => terminal = Some(value()),
+            "--type" => typed = value(),
+            "--resume" => resume = true,
+            "--close" => close = true,
+            "--watch-terminal" => watch_for = value().parse().expect("--watch-terminal SECONDS"),
+            "--watch-clipboard" => watch_clipboard = true,
+            "--camera" => camera = true,
+            "--mic" => mic = true,
+            "--picture" => picture = Some(value().into()),
+            "--location" => location = value().split_once(',').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?))),
+            "--away" => away = true,
+            "--files" => files = Some(value().into()),
+            "--gallery" => gallery = Some(value().into()),
+            "--leave-after" => leave_after = Some(value().parse().expect("--leave-after SECONDS")),
+            "--press" => {
+                press = Some(match value().as_str() {
+                    "next" => linksy_core::MediaCommand::Next,
+                    "previous" => linksy_core::MediaCommand::Previous,
+                    _ => linksy_core::MediaCommand::PlayPause,
+                })
+            }
+            "--media" => {
+                let title = value();
+                media = Some((title, value()));
+            }
+            "--notify" => {
+                let title = value();
+                notify = Some((title, value()));
+            }
+            "--deck" => {
+                let run = value();
+                deck = Some(match run.split_once('=') {
+                    Some((action, v)) => (action.to_string(), Some(v.parse().expect("--deck ACTION=VALUE"))),
+                    None => (run, None),
+                });
+            }
+            "--deck-layout" => deck_layout = true,
+            "--deck-wait" => deck_wait = value().parse().expect("--deck-wait SECONDS"),
+            "--chats" => chats = true,
+            "--notifications-later" => notifications_later = Some(value().parse().expect("--notifications-later SECONDS")),
+            "--off" => off.push(value()),
+            "--turn-on" => turn_on = true,
+            other => panic!("unknown option {other}"),
+        }
+    }
+    let data_dir = std::path::PathBuf::from(data_dir.expect("--data-dir DIR"));
+    let mut config = Config::new(data_dir.clone(), data_dir.join("downloads"), name);
+    config.kind = DeviceKind::Phone;
+    config.os = "android".into();
+    config.discovery = !no_discovery;
+    config.port = port;
+    config.away = away;
+    // What it does, like a phone that says so (Locate shows only then).
+    config.features = ["files", "clipboard", "open_url", "battery", "ring", "media_remote", "call_state", "heartbeat", "import", "fs", "input", "screen", "camera", "display", "watch", "locate", "microphone", "notifications"].map(String::from).to_vec();
+    if notifications_later.is_some() {
+        config.features.retain(|f| f != "notifications");
+    }
+    if gallery.is_some() {
+        config.features.push("gallery".into());
+    }
+    if chats {
+        config.features.push("inbox_history".into());
+    }
+    if deck_layout {
+        config.features.push("deck_layout".into());
+    }
+    if turn_on {
+        config.features.push("turn_on".into());
+    }
+    config.features.retain(|f| !off.contains(f));
+    config.relay = Some(std::env::var("LINKSY_RELAY").unwrap_or_else(|_| "https://linksy-relay.diary.mg".into()));
+    let node = Node::start(config).await.expect("start");
+    let mut events = node.subscribe();
+    println!("{} ({}) up", node.info().name, node.info().id.short());
+    let connected = match connect {
+        Some(addr) => match tokio::time::timeout(Duration::from_secs(10), node.connect(addr)).await {
+            Ok(Ok(d)) => {
+                println!("connected to {}", d.name);
+                true
+            }
+            Ok(Err(e)) => {
+                println!("connect {addr}: {e}");
+                false
+            }
+            Err(_) => {
+                println!("connect {addr}: timed out");
+                false
+            }
+        },
+        None => false,
+    };
+
+    if !connected && (level.is_some() || clip_file.is_some() || clip_text.is_some() || watch_clipboard || picture.is_some() || terminal.is_some() || deck.is_some()) {
+        // These need the computer connected first.
+        let _ = tokio::time::timeout(Duration::from_secs(30), async {
+            while !matches!(events.recv().await, Ok(Event::Connected { .. }) | Err(_)) {}
+        })
+        .await;
+    }
+    if let Some(level) = level {
+        for t in node.trusted() {
+            match node.send_battery(&t.device.id, Battery { level, charging }).await {
+                Ok(()) => println!("battery {level}% sent to {}", t.device.name),
+                Err(e) => println!("battery to {}: {e}", t.device.name),
+            }
+        }
+    }
+    if let Some((title, body)) = notify {
+        let n = RemoteNotification {
+            key: "fake|messages|1".into(),
+            app: "org.example.messages".into(),
+            app_name: "Messages".into(),
+            title,
+            body,
+            can_reply: true,
+            actions: vec![NotificationButton { id: "read".into(), label: "Mark as Read".into() }],
+            ..Default::default()
+        };
+        for t in node.trusted() {
+            match node.post_notification(&t.device.id, n.clone()).await {
+                Ok(()) => println!("notification sent to {}", t.device.name),
+                Err(e) => println!("notification to {}: {e}", t.device.name),
+            }
+        }
+    }
+    if let Some(s) = notifications_later {
+        tokio::time::sleep(Duration::from_secs(s)).await;
+        let mut features = node.info().features;
+        features.push("notifications".into());
+        node.set_features(features).await;
+        println!("notifications turned on");
+    }
+    if chats {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let read = || vec![NotificationButton { id: "read".into(), label: "Mark as read".into() }];
+        let chat = |key: &str, app: &str, app_name: &str, title: &str, body: &str| RemoteNotification {
+            key: key.into(),
+            app: app.into(),
+            app_name: app_name.into(),
+            title: title.into(),
+            body: body.into(),
+            can_reply: true,
+            actions: read(),
+            category: Some("msg".into()),
+            time: Some(now),
+            ..Default::default()
+        };
+        let list = [
+            RemoteNotification { conversation: Some("Alice".into()), ..chat("0|com.whatsapp|1|alice", "com.whatsapp", "WhatsApp", "Alice", "Are we still on for lunch?") },
+            RemoteNotification {
+                conversation: Some("Family".into()),
+                sender: Some("Bob".into()),
+                group: true,
+                messages: vec![
+                    linksy_core::ConversationMessage { sender: Some("Mum".into()), text: "Is everyone coming on Sunday?".into(), time: Some(now - 2_400_000), mine: false },
+                    linksy_core::ConversationMessage { sender: None, text: "Me too. I'll bring the cake".into(), time: Some(now - 1_200_000), mine: true },
+                    linksy_core::ConversationMessage { sender: Some("Bob".into()), text: "Photos from Sunday are up".into(), time: Some(now), mine: false },
+                ],
+                ..chat("0|com.whatsapp|1|family", "com.whatsapp", "WhatsApp", "Family", "Bob: Photos from Sunday are up")
+            },
+            RemoteNotification { can_reply: false, ..chat("0|com.google.android.apps.messaging|1|bank", "com.google.android.apps.messaging", "Messages", "BNI", "Your verification code is 482913. It expires in 5 minutes. Never share it.") },
+            RemoteNotification { category: Some("email".into()), can_reply: false, ..chat("0|com.google.android.gm|1|mail", "com.google.android.gm", "Gmail", "GitHub", "[LinkSy-mg/linksy-desktop] New issue: Extended screen taps") },
+            RemoteNotification { conversation: Some("#general".into()), sender: Some("ana".into()), group: true, ..chat("0|com.discord|1|general", "com.discord", "Discord", "Linksy · #general", "ana: the new release works on my Steam Deck") },
+            // An older phone: no messaging details, the desktop has to read the title
+            RemoteNotification { category: None, time: None, ..chat("0|com.facebook.orca|1|carol", "com.facebook.orca", "Messenger", "Carol (2 messages)", "See you tomorrow!") },
+            // Not messages: they go under Other Notifications
+            RemoteNotification { category: Some("reminder".into()), can_reply: false, actions: vec![], ..chat("0|com.google.android.calendar|1|sync", "com.google.android.calendar", "Calendar", "Team sync in 15 minutes", "Room 2 · until 15:00") },
+            RemoteNotification { category: None, can_reply: false, actions: vec![], ..chat("0|mg.bank.app|1|login", "mg.bank.app", "Bank", "Sign in to your account", "Your code is 771204") },
+        ];
+        for t in node.trusted() {
+            for n in &list {
+                match node.post_notification(&t.device.id, n.clone()).await {
+                    Ok(()) => println!("{} from {} sent to {}", n.app_name, n.title, t.device.name),
+                    Err(e) => println!("{}: {e}", n.app_name),
+                }
+            }
+        }
+    }
+    let seq = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let mut playing = true;
+    let song = |title: &str, artist: &str, playing: bool| MediaState {
+        seq: seq(),
+        players: vec![MediaPlayer {
+            id: "music".into(),
+            app: "Music".into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: String::new(),
+            playing,
+            position_ms: Some(42_000),
+            length_ms: Some(215_000),
+            can_next: true,
+            can_previous: true,
+            can_seek: true,
+            art: None,
+        }],
+    };
+    for t in node.trusted() {
+        if let Some((title, artist)) = &media {
+            let r = node.send_media_state(&t.device.id, &song(title, artist, playing)).await;
+            println!("media to {}: {}", t.device.name, r.map(|_| "sent".to_string()).unwrap_or_else(|e| e.to_string()));
+        }
+        if let Some(path) = &picture {
+            use std::io::Write;
+            let bytes = std::fs::read(path).expect("picture file");
+            // Base64 by hand: the core has no encoder.
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut b64 = Vec::new();
+            for c in bytes.chunks(3) {
+                let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+                let _ = b64.write_all(&[A[(n >> 18) as usize & 63], A[(n >> 12) as usize & 63], if c.len() > 1 { A[(n >> 6) as usize & 63] } else { b'=' }, if c.len() > 2 { A[n as usize & 63] } else { b'=' }]);
+            }
+            let r = node.send_picture(&t.device.id, &String::from_utf8(b64).unwrap()).await;
+            println!("picture to {}: {:?}", t.device.name, r.map_err(|e| e.to_string()));
+        }
+        if let Some(code) = &terminal {
+            use linksy_core::protocol::control_frame;
+            use linksy_core::{ControlMsg, TerminalOpen};
+            let mut id = None;
+            if resume {
+                let _ = node.list_terminals(&t.device.id).await;
+                id = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Ok(Event::Terminals { list, .. }) = events.recv().await {
+                            println!("terminals: {:?}", list.iter().map(|t| (&t.id, &t.title)).collect::<Vec<_>>());
+                            return list.first().map(|t| t.id.clone());
+                        }
+                    }
+                })
+                .await
+                .ok()
+                .flatten();
+            }
+            let open = TerminalOpen { code: code.clone(), cols: 80, rows: 24, resume: id };
+            match node.request_terminal(&t.device.id, open).await {
+                Ok((mut s, id)) => {
+                    println!("terminal {id} on {}", t.device.name);
+                    let _ = s.send.write_all(&control_frame(&ControlMsg::TermInput { data: format!("{typed}\r") })).await;
+                    let mut out = Vec::new();
+                    let mut buf = vec![0u8; 8192];
+                    let watched = std::time::Instant::now();
+                    let _ = tokio::time::timeout(Duration::from_secs(watch_for), async {
+                        while let Ok(Some(n)) = s.recv.read(&mut buf).await {
+                            out.extend_from_slice(&buf[..n]);
+                        }
+                    })
+                    .await;
+                    println!("terminal output: {:?}", String::from_utf8_lossy(&out));
+                    println!("terminal watched for {:.1} s", watched.elapsed().as_secs_f64());
+                    if close {
+                        let _ = s.send.write_all(&control_frame(&ControlMsg::TermClose)).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    let _ = s.send.finish();
+                }
+                Err(e) => println!("terminal refused: {e:?}"),
+            }
+        }
+        if let Some((action, value)) = &deck {
+            let pc = t.device.id;
+            let _ = node.deck_open(&pc, true).await;
+            // Its list, its layouts if it takes them, then the state: each a stream of its
+            // own, in whichever order
+            let (mut listed, mut stated, mut laid) = (false, false, !deck_layout);
+            while !(listed && stated && laid) {
+                let Some(e) = deck_message(&mut events, &pc).await else {
+                    println!("no deck answer from {}", t.device.name);
+                    break;
+                };
+                listed |= matches!(e, Event::DeckActions { .. });
+                stated |= matches!(e, Event::DeckState { .. });
+                laid |= matches!(e, Event::DeckLayout { .. });
+                print_deck(&e, "DECK_STATE");
+            }
+            let r = node.deck_run(&pc, action, *value).await;
+            println!("ran {action}{}: {:?}", value.map(|v| format!("={v}")).unwrap_or_default(), r.map_err(|e| e.to_string()));
+            // A new list may come first, when it changed on the computer meanwhile
+            let mut after = false;
+            while let Some(e) = deck_message(&mut events, &pc).await {
+                print_deck(&e, "DECK_STATE_AFTER");
+                if matches!(e, Event::DeckState { .. }) {
+                    after = true;
+                    break;
+                }
+            }
+            if !after {
+                println!("no state after {action}: refused");
+            }
+            let until = tokio::time::Instant::now() + Duration::from_secs(deck_wait);
+            while tokio::time::Instant::now() < until {
+                if let Ok(Some(e)) = tokio::time::timeout_at(until, deck_message(&mut events, &pc)).await {
+                    print_deck(&e, "DECK_STATE");
+                }
+            }
+            let _ = node.deck_open(&pc, false).await;
+        }
+        if let Some(text) = &clip_text {
+            let r = node.send_clipboard(&t.device.id, text).await;
+            println!("clipboard to {}: {}", t.device.name, r.map(|_| "sent".to_string()).unwrap_or_else(|e| e.to_string()));
+        }
+        if let Some(path) = &clip_file {
+            let r = node.send_clipboard_file(&t.device.id, path.clone()).await;
+            println!("clipboard file to {}: {}", t.device.name, r.map(|_| "sent".to_string()).unwrap_or_else(|e| e.to_string()));
+        }
+        if watch_clipboard {
+            let r = node.watch_clipboard(&t.device.id, true).await;
+            println!("watching {}'s clipboard: {:?}", t.device.name, r.map_err(|e| e.to_string()));
+        }
+        if let Some(path) = &import {
+            let r = node.import_files(&t.device.id, vec![path.clone()]).await;
+            println!("import to {}: {}", t.device.name, r.map(|_| "started".to_string()).unwrap_or_else(|e| e.to_string()));
+        }
+        if touchpad {
+            use linksy_core::{ControlMsg, MouseButton, protocol::control_frame};
+            match node.request_session(&t.device.id, linksy_core::SessionKind::Input).await {
+                Ok(mut s) => {
+                    println!("touchpad on {}", t.device.name);
+                    let msgs = [
+                        ControlMsg::PointerBy { dx: 40.0, dy: -12.5 },
+                        ControlMsg::Button { button: MouseButton::Left, pressed: true },
+                        ControlMsg::Button { button: MouseButton::Left, pressed: false },
+                        ControlMsg::Text { text: "hello".into() },
+                        ControlMsg::Key { keysym: 0xff53, pressed: true, code: None },
+                        ControlMsg::Key { keysym: 0xff53, pressed: false, code: None },
+                    ];
+                    for m in &msgs {
+                        let _ = s.send.write_all(&control_frame(m)).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = s.send.finish();
+                }
+                Err(e) => println!("touchpad on {}: {e}", t.device.name),
+            }
+        }
+        if let Some(path) = &view_screen {
+            match node.request_session(&t.device.id, linksy_core::SessionKind::Screen).await {
+                Ok(mut s) => {
+                    let mut file = tokio::fs::File::create(path).await.expect("screen file");
+                    let _ = tokio::time::timeout(Duration::from_secs(4), tokio::io::copy(&mut s.recv, &mut file)).await;
+                    let n = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+                    println!("screen of {}: {n} bytes saved", t.device.name);
+                    let _ = s.send.finish();
+                }
+                Err(e) => println!("screen of {}: {e}", t.device.name),
+            }
+        }
+        if watch_media {
+            let _ = node.watch_media(&t.device.id, true).await;
+        }
+    }
+    if let Some(root) = files {
+        let mut calls = node.incoming_fs().expect("file requests");
+        tokio::spawn(async move {
+            // Side by side, like a phone: copies ask for a few chunks at once
+            while let Some(call) = calls.recv().await {
+                let root = root.clone();
+                tokio::spawn(async move { serve(call, &root).await });
+            }
+        });
+    }
+    if let Some(root) = gallery {
+        let mut calls = node.incoming_gallery().expect("gallery requests");
+        let serving = node.clone();
+        let watched = root.clone();
+        tokio::spawn(async move {
+            while let Some(call) = calls.recv().await {
+                show_gallery(call, &root, &serving).await;
+            }
+        });
+        // A file added or removed under DIR is told to the computers, as the phone does
+        let node = node.clone();
+        tokio::spawn(async move {
+            let ids = |root: &std::path::Path| gallery_items(root).into_iter().map(|(item, _, _)| item.id).collect::<Vec<_>>();
+            let mut last = ids(&watched);
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let now = ids(&watched);
+                if now == last {
+                    continue;
+                }
+                last = now;
+                for v in node.devices().into_iter().filter(|v| v.trusted && v.connected) {
+                    match node.gallery_changed(&v.device.id).await {
+                        Ok(()) => println!("gallery changed, told {}", v.device.name),
+                        Err(e) => println!("gallery changed: {e}"),
+                    }
+                }
+            }
+        });
+    }
+    if let Some(seconds) = call {
+        let node = node.clone();
+        tokio::spawn(async move {
+            use linksy_core::CallState::*;
+            for (state, wait) in [(Ringing, 2), (Active, seconds), (Idle, 0)] {
+                for t in node.trusted() {
+                    let _ = node.send_call_state(&t.device.id, state, Some("Alice")).await;
+                }
+                println!("call: {state:?}");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            }
+        });
+    }
+    if camera {
+        let mut sessions = node.incoming_sessions().expect("sessions");
+        let node = node.clone();
+        tokio::spawn(async move {
+            while let Some(mut s) = sessions.recv().await {
+                let (id, peer) = (s.id, s.peer.clone());
+                let state = serde_json::json!({"width":1280,"height":720,"facing":"back","lens":"0",
+                    "lenses":[{"id":"0","facing":"back","zoom":1.0,"main":true},{"id":"2","facing":"back","zoom":0.6,"main":false},{"id":"1","facing":"front","zoom":1.0,"main":true}],
+                    "zoom":1.0,"zoom_min":0.6,"zoom_max":10.0,"zoom_presets":[0.6,1,2,5,10],"torch":false,"has_torch":true,
+                    "focus":"auto","focus_modes":["auto","point","manual"],"focus_distance":0.0,"focus_point":null,
+                    "exposure":0,"exposure_min":-12,"exposure_max":12,"exposure_step":0.1667,"exposure_lock":false,
+                    "white_balance":"auto","white_balances":["auto","daylight","cloudy","shade","incandescent","fluorescent"],"white_balance_lock":false,
+                    "stabilization":true,"has_stabilization":true,"quality":"standard","orientation":"landscape","rotation":0,
+                    "fps":30,"fps_options":[30,60],"camera_width":1280,"camera_height":720,
+                    "size_options":[[1280,720],[1920,1080]]});
+                let r = node.send_camera_state(&peer.id, id, state).await;
+                println!("camera for {}: state sent {:?}", peer.name, r.map_err(|e| e.to_string()));
+                // A test picture, when GStreamer's command line is there.
+                let (send, recv) = (&mut s.send, &mut s.recv);
+                let picture = async move {
+                    let child = tokio::process::Command::new("gst-launch-1.0")
+                        .args(["-q", "videotestsrc", "is-live=true", "!", "video/x-raw,width=1280,height=720,framerate=30/1", "!", "x264enc", "tune=zerolatency", "speed-preset=superfast", "!", "h264parse", "config-interval=-1", "!", "fdsink", "fd=1"])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .kill_on_drop(true)
+                        .spawn();
+                    if let Ok(mut child) = child {
+                        let mut out = child.stdout.take().unwrap();
+                        let _ = tokio::io::copy(&mut out, send).await;
+                    }
+                };
+                // camera_control frames: u32 big-endian length, then JSON.
+                let controls = async move {
+                    use tokio::io::AsyncReadExt;
+                    while let Ok(len) = recv.read_u32().await {
+                        let mut body = vec![0; len as usize];
+                        if recv.read_exact(&mut body).await.is_err() {
+                            break;
+                        }
+                        println!("CAMERA_CONTROL {}", String::from_utf8_lossy(&body));
+                    }
+                };
+                tokio::select! {
+                    _ = picture => {}
+                    _ = controls => {}
+                }
+                println!("camera for {} ended", peer.name);
+            }
+        });
+    }
+    if mic {
+        let mut sessions = node.incoming_sessions().expect("sessions");
+        tokio::spawn(async move {
+            while let Some(mut s) = sessions.recv().await {
+                let mut tick = tokio::time::interval(Duration::from_millis(10));
+                let mut n = 0u64;
+                loop {
+                    tick.tick().await;
+                    let chunk: Vec<u8> = (n..n + 480)
+                        .flat_map(|i| {
+                            let (t, tau) = (i as f64 / 48_000.0, std::f64::consts::TAU);
+                            let swell = ((t * 2.3 * tau).sin() * (t * 0.45 * tau).sin()).abs();
+                            (((t * 440.0 * tau).sin() * 16_000.0 * swell) as i16).to_le_bytes()
+                        })
+                        .collect();
+                    n += 480;
+                    if s.send.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                println!("microphone for {} ended", s.peer.name);
+            }
+        });
+    }
+    if let Some(path) = display.clone() {
+        let mut sessions = node.incoming_sessions().expect("sessions");
+        tokio::spawn(async move {
+            while let Some(mut s) = sessions.recv().await {
+                let mut file = tokio::fs::File::create(&path).await.expect("display file");
+                let n = tokio::io::copy(&mut s.recv, &mut file).await.unwrap_or(0);
+                println!("display from {} ended: {n} bytes saved", s.peer.name);
+            }
+        });
+    }
+    let deadline = tokio::time::sleep(Duration::from_secs(seconds));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            e = events.recv() => match e {
+                Ok(Event::Clipboard { from, text }) => println!("CLIPBOARD from {}: {text}", from.name),
+                Ok(Event::Ring { from, on }) => println!("{} {}", if on { "RING from" } else { "ring stopped by" }, from.name),
+                Ok(Event::TransferComplete { .. }) if import.is_some() => println!("import done"),
+                Ok(Event::TransferFailed { reason, .. }) if import.is_some() => println!("import failed: {reason}"),
+                Ok(Event::OpenUrl { from, url }) => println!("open {url} (from {})", from.name),
+                Ok(Event::NotificationReply { from, key, text }) => println!("REPLY to {key} from {}: {text}", from.name),
+                Ok(Event::NotificationAction { key, action, .. }) => println!("ACTION {action} on {key}"),
+                Ok(Event::NotificationDismissed { key, .. }) => println!("DISMISSED {key}"),
+                Ok(e @ Event::DeckLayout { .. }) => print_deck(&e, ""),
+                // A made-up past: a message every hour, three days back.
+                Ok(Event::InboxHistory { from, app, conversation, before_ms, limit }) if chats => {
+                    let oldest = before_ms.saturating_sub(3 * 86_400_000);
+                    let times: Vec<u64> = (1..=limit as u64).map(|i| before_ms.saturating_sub(i * 3_600_000)).filter(|t| *t > oldest).collect();
+                    let more = times.len() == limit as usize;
+                    let messages = times
+                        .into_iter()
+                        .rev()
+                        .enumerate()
+                        .map(|(i, time)| linksy_core::ConversationMessage { sender: Some(if i % 2 == 0 { "Mum" } else { "Bob" }.into()), text: format!("Earlier message {}", i + 1), time: Some(time), mine: i % 5 == 4 })
+                        .collect::<Vec<_>>();
+                    println!("history for {conversation}: {} messages{}", messages.len(), if more { ", more" } else { "" });
+                    let _ = node.inbox_history_page(&from.id, &app, &conversation, messages, more).await;
+                }
+                Ok(Event::HeartbeatWatch { from, on: true, every_s }) => {
+                    println!("{} asks for a heartbeat every {every_s} s", from.name);
+                    let node = node.clone();
+                    let started = std::time::Instant::now();
+                    tokio::spawn(async move {
+                        loop {
+                            if leave_after.is_some_and(|s| started.elapsed().as_secs() >= s) {
+                                println!("walked away");
+                                break;
+                            }
+                            let _ = node.heartbeat(&from.id).await;
+                            tokio::time::sleep(Duration::from_secs(every_s.into())).await;
+                        }
+                    });
+                }
+                Ok(Event::SmsListThreads { from, .. }) => {
+                    let _ = node.sms_threads(&from.id, fake_threads()).await;
+                }
+                Ok(Event::SmsListMessages { from, thread, .. }) => {
+                    let _ = node.sms_messages(&from.id, &thread, fake_messages(&thread), false).await;
+                }
+                Ok(Event::SmsSend { from, client_id, to, text }) => {
+                    println!("TEXT to {}: {text}", to.join(", "));
+                    let _ = node.sms_sent(&from.id, &client_id, true, None).await;
+                    let message = linksy_core::SmsMessage { id: format!("m{}", seq()), from_me: true, address: String::new(), body: text, date_ms: seq() };
+                    let _ = node.sms_message(&from.id, "1", message).await;
+                }
+                Ok(Event::MediaCommand { from, player, command }) => {
+                    println!("MEDIA {command:?} on {player} from {}", from.name);
+                    // Act like a player: play/pause flips, and the computer hears about it.
+                    if let (Some((title, artist)), linksy_core::MediaCommand::PlayPause | linksy_core::MediaCommand::Pause | linksy_core::MediaCommand::Play) = (&media, command) {
+                        playing = match command {
+                            linksy_core::MediaCommand::Play => true,
+                            linksy_core::MediaCommand::Pause => false,
+                            _ => !playing,
+                        };
+                        let _ = node.send_media_state(&from.id, &song(title, artist, playing)).await;
+                    }
+                }
+                Ok(Event::MediaState { from, state }) => {
+                    for p in &state.players {
+                        println!("{} plays: {} – {} ({}) [{}]", from.name, p.artist, p.title, p.app, if p.playing { "playing" } else { "paused" });
+                    }
+                    if state.players.is_empty() {
+                        println!("{} plays nothing", from.name);
+                    }
+                    if let (Some(command), Some(p)) = (press.take(), state.players.first()) {
+                        println!("pressing {command:?} on {}", p.app);
+                        let _ = node.media_command(&from.id, &p.id, command).await;
+                    }
+                }
+                Ok(Event::TurnOnRequest { from, feature }) => {
+                    println!("TURN ON ASKED {feature} by {}", from.name);
+                    let mut features = node.info().features;
+                    if turn_on && ["notifications", "gallery"].contains(&feature.as_str()) && !features.contains(&feature) {
+                        features.push(feature.clone());
+                        node.set_features(features).await;
+                        println!("{feature} turned on");
+                    }
+                }
+                Ok(Event::LocateRequest { from }) => {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let r = match location {
+                        Some((lat, lon)) => node.send_location(&from.id, lat, lon, Some(15.0), now).await,
+                        None => node.refuse_location(&from.id, "Location is off on this phone").await,
+                    };
+                    println!("located by {}: {:?}", from.name, r.map_err(|e| e.to_string()));
+                }
+                Ok(Event::PairingRequest { request, device, code, .. }) if accept_pairing => {
+                    println!("pairing with {} (code {code}): accepting", device.name);
+                    node.respond(request, true);
+                }
+                Ok(Event::SessionRequest { request, from, kind: linksy_core::SessionKind::Camera }) if camera => {
+                    println!("camera requested by {}: accepting", from.name);
+                    node.respond(request, true);
+                }
+                Ok(Event::SessionRequest { request, from, kind: linksy_core::SessionKind::Microphone }) if mic => {
+                    println!("microphone requested by {}: accepting", from.name);
+                    node.respond(request, true);
+                }
+                Ok(Event::SessionRequest { request, from, kind }) if display.is_some() => {
+                    println!("{kind:?} requested by {}: accepting as a 2400×1080 screen", from.name);
+                    node.respond_session(request, true, Some((2400, 1080)));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+        }
+    }
+    node.shutdown().await;
+}
+
+/// The next deck list or state from `pc`, within 5 s.
+async fn deck_message(events: &mut tokio::sync::broadcast::Receiver<Event>, pc: &linksy_core::Fingerprint) -> Option<Event> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let e = match events.recv().await {
+                Ok(e) => e,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            };
+            if let Event::DeckActions { from, .. } | Event::DeckState { from, .. } | Event::DeckLayout { from, .. } = &e
+                && from.id == *pc
+            {
+                return Some(e);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// A deck message from the computer, the layouts in short.
+fn print_deck(e: &Event, state: &str) {
+    match e {
+        Event::DeckActions { actions, .. } => println!("DECK_ACTIONS {}", serde_json::to_string(actions).unwrap()),
+        Event::DeckState { states, .. } => println!("{state} {}", serde_json::to_string(states).unwrap()),
+        Event::DeckLayout { layouts, .. } => {
+            let tiles = |f: &linksy_core::DeckFace| f.pages.iter().map(Vec::len).sum::<usize>();
+            let each: Vec<String> = layouts.layouts.iter().map(|l| format!("{}:{}/{}", l.id, tiles(&l.portrait), tiles(&l.landscape))).collect();
+            println!("DECK_LAYOUT version={} active={} layouts={} tiles(portrait/landscape)={}", layouts.version, layouts.active, layouts.layouts.len(), each.join(","));
+        }
+        _ => {}
+    }
+}
+
+fn fake_threads() -> Vec<linksy_core::SmsThread> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    vec![
+        linksy_core::SmsThread { id: "1".into(), addresses: vec!["+261340000001".into()], names: vec!["Alice".into()], snippet: "Lunch at 1?".into(), date_ms: now - 60_000, unread: true },
+        linksy_core::SmsThread { id: "2".into(), addresses: vec!["+261340000002".into()], names: vec!["Bob".into()], snippet: "The files are on your desk".into(), date_ms: now - 7_200_000, unread: false },
+        linksy_core::SmsThread { id: "3".into(), addresses: vec!["3030".into()], names: vec![], snippet: "Your code is 481 902".into(), date_ms: now - 90_000_000, unread: false },
+    ]
+}
+
+fn fake_messages(thread: &str) -> Vec<linksy_core::SmsMessage> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    // (sent by this phone's owner, text)
+    let lines: &[(bool, &str)] = match thread {
+        "1" => &[(false, "Lunch at 1?"), (true, "Where?"), (false, "The new ramen place near the station"), (false, "Hey are you there?")],
+        "2" => &[(false, "The files are on your desk"), (true, "Thanks!")],
+        _ => &[(false, "Your code is 481 902")],
+    };
+    // Newest first, as the protocol has it. Nobody ever answers "Hey are you there?".
+    lines.iter().enumerate().rev().map(|(i, (mine, body))| linksy_core::SmsMessage {
+        id: format!("{thread}-{i}"),
+        from_me: *mine,
+        address: if *mine { String::new() } else { "+261340000001".into() },
+        body: (*body).into(),
+        date_ms: now - (lines.len() - i) as u64 * 600_000,
+    }).collect()
+}
+
+/// Answer a file request from `root`, as a phone serves its storage.
+/// The photos and videos under `root`, newest first by modification time (then id).
+fn gallery_items(root: &std::path::Path) -> Vec<(linksy_core::GalleryItem, String, std::path::PathBuf)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    let mut items: Vec<_> = files
+        .into_iter()
+        .filter_map(|path| {
+            let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+            let video = matches!(ext.as_str(), "mp4" | "mkv" | "webm" | "3gp");
+            if !video && !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "heic") {
+                return None;
+            }
+            let meta = path.metadata().ok()?;
+            let taken_ms = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+            let id = path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            let album = path.parent()?.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let item = linksy_core::GalleryItem { id, name, video, taken_ms, size: meta.len(), duration_ms: video.then_some(14_000) };
+            Some((item, album, path))
+        })
+        .collect();
+    items.sort_by(|a, b| (b.0.taken_ms, &b.0.id).cmp(&(a.0.taken_ms, &a.0.id)));
+    items
+}
+
+async fn show_gallery(call: linksy_core::gallery::GalleryCall, root: &std::path::Path, node: &Node) {
+    use linksy_core::GalleryRequest;
+    let all = gallery_items(root);
+    let result = match call.request.clone() {
+        GalleryRequest::Albums => {
+            let mut albums: Vec<linksy_core::GalleryAlbum> = Vec::new();
+            for (_, album, _) in &all {
+                match albums.iter_mut().find(|a| a.id == *album) {
+                    Some(a) => a.count += 1,
+                    None => albums.push(linksy_core::GalleryAlbum { id: album.clone(), name: album.rsplit('/').next().unwrap_or(album).to_string(), count: 1 }),
+                }
+            }
+            call.albums(albums).await
+        }
+        GalleryRequest::Items { album, before, limit } => {
+            let matching: Vec<_> = all
+                .into_iter()
+                .filter(|(_, a, _)| album.as_ref().is_none_or(|want| want == a))
+                .filter(|(item, _, _)| before.as_ref().is_none_or(|b| (item.taken_ms, &item.id) < (b.taken_ms, &b.id)))
+                .map(|(item, _, _)| item)
+                .collect();
+            let more = matching.len() > limit as usize;
+            println!("gallery page: {} items{}", matching.len().min(limit as usize), if more { ", more" } else { "" });
+            call.items(matching.into_iter().take(limit as usize).collect(), more).await
+        }
+        GalleryRequest::Thumb { id, .. } => match all.iter().find(|(item, _, _)| item.id == id) {
+            Some((_, _, path)) => match std::fs::read(path) {
+                Ok(bytes) if bytes.len() as u64 <= linksy_core::gallery::MAX_THUMB && (bytes.starts_with(&[0xff, 0xd8]) || bytes.starts_with(b"\x89PNG")) => call.thumb(&bytes).await,
+                _ => call.error("no thumbnail for this one").await,
+            },
+            None => call.error("no such photo").await,
+        },
+        GalleryRequest::Send { ids, transfer } => {
+            let paths: Vec<_> = all.iter().filter(|(item, _, _)| ids.contains(&item.id)).map(|(_, _, path)| path.clone()).collect();
+            let to = call.from.id;
+            if paths.is_empty() {
+                call.error("no such photos").await
+            } else {
+                let sent = call.ok().await;
+                match node.send_gallery(&to, paths, transfer).await {
+                    Ok(_) => println!("gallery: sending {} to the computer", ids.len()),
+                    Err(e) => println!("gallery send: {e}"),
+                }
+                sent
+            }
+        }
+    };
+    if let Err(e) = result {
+        println!("gallery answer: {e}");
+    }
+}
+
+async fn serve(mut call: linksy_core::fs::FsCall, root: &std::path::Path) {
+    use linksy_core::{FsEntry, FsRequest};
+    use std::io::{Read, Seek, Write};
+    // Nothing above the shared folder, as on a phone
+    let at = |p: &str| {
+        let rel = std::path::Path::new(p.trim_start_matches('/'));
+        match rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+            true => Ok(root.join(rel)),
+            false => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the shared folder")),
+        }
+    };
+    let entry = |p: &std::path::Path| {
+        let m = std::fs::metadata(p).ok()?;
+        let modified_ms = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+        Some(FsEntry { name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), dir: m.is_dir(), size: m.len(), modified_ms })
+    };
+    println!("files: {:?}", call.request);
+    let body = call.body().await.unwrap_or_default();
+    // Do it, then answer: entries, an entry, data, done, or what went wrong.
+    enum Answer {
+        Info(String),
+        Entries(Vec<FsEntry>),
+        Entry(FsEntry),
+        Data(Vec<u8>),
+        Ok,
+    }
+    let done: std::io::Result<Answer> = (|| match call.request.clone() {
+        FsRequest::Info => Ok(Answer::Info(root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+        FsRequest::List { path } => Ok(Answer::Entries(std::fs::read_dir(at(&path)?)?.flatten().filter_map(|e| entry(&e.path())).collect())),
+        FsRequest::Stat { path } => entry(&at(&path)?).map(Answer::Entry).ok_or_else(|| std::io::ErrorKind::NotFound.into()),
+        FsRequest::Read { path, offset, length } => {
+            let mut f = std::fs::File::open(at(&path)?)?;
+            f.seek(std::io::SeekFrom::Start(offset))?;
+            let mut buf = Vec::new();
+            f.take(length).read_to_end(&mut buf)?;
+            Ok(Answer::Data(buf))
+        }
+        FsRequest::Write { path, offset, truncate, .. } => {
+            let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(truncate).open(at(&path)?)?;
+            f.seek(std::io::SeekFrom::Start(offset))?;
+            f.write_all(&body)?;
+            Ok(Answer::Ok)
+        }
+        FsRequest::Mkdir { path } => std::fs::create_dir_all(at(&path)?).map(|_| Answer::Ok),
+        FsRequest::Delete { path } => {
+            let p = at(&path)?;
+            if p == root {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the shared folder itself stays"));
+            }
+            if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }.map(|_| Answer::Ok)
+        }
+        FsRequest::Rename { path, to } => std::fs::rename(at(&path)?, at(&to)?).map(|_| Answer::Ok),
+    })();
+    let _ = match done {
+        Ok(Answer::Info(name)) => call.info(&name).await,
+        Ok(Answer::Entries(e)) => call.entries(e).await,
+        Ok(Answer::Entry(e)) => call.entry(e).await,
+        Ok(Answer::Data(d)) => call.data(&d).await,
+        Ok(Answer::Ok) => call.ok().await,
+        Err(e) => call.error(&e.to_string(), e.kind() == std::io::ErrorKind::NotFound).await,
+    };
+}

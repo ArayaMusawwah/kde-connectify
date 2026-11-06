@@ -1,0 +1,16 @@
+Package: linksy
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Linksy <https://github.com/LinkSy-mg/linksy-releases>
+Installed-Size: @SIZE@
+Depends: linksy-common (= @VERSION@), libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5)
+Recommends: gstreamer1.0-gtk4
+Section: net
+Priority: optional
+Homepage: https://github.com/LinkSy-mg/linksy-releases
+Description: Your devices, connected
+ Linksy connects your computer and phone directly over your own network, with no
+ account, cloud or server: send files and your clipboard, see and control another
+ device's screen, use a tablet as a second display, or a phone as a webcam.
+ .
+ This is the GTK app, for GNOME and most desktops; linksy-qt is the one for KDE Plasma.

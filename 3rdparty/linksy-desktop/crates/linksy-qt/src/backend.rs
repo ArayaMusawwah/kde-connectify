@@ -1,0 +1,746 @@
+//! The QML app's window on linksyd. QML sends requests as JSON (the same `{"cmd": …}`
+//! the service reads) and gets the reply back as a signal; the service's events and
+//! history changes arrive as signals too, always on the Qt thread.
+
+#[cxx_qt::bridge]
+pub mod qobject {
+    unsafe extern "C++" {
+        include!("cxx-qt-lib/qstring.h");
+        type QString = cxx_qt_lib::QString;
+    }
+
+    extern "RustQt" {
+        #[qobject]
+        #[qml_element]
+        #[qproperty(bool, connected)]
+        #[qproperty(bool, starting)]
+        type Backend = super::BackendRust;
+
+        /// Connect to the service, starting it first when it isn't running.
+        #[qinvokable]
+        fn start(self: Pin<&mut Self>);
+
+        /// Send `request` (JSON); `reply` answers with the same id.
+        #[qinvokable]
+        fn call(self: Pin<&mut Self>, request: &QString) -> i32;
+
+        #[qinvokable]
+        fn tr(&self, english: &QString) -> QString;
+
+        #[qinvokable]
+        fn env(&self, name: &QString) -> QString;
+
+        #[qinvokable]
+        fn version(&self) -> QString;
+
+        #[qinvokable]
+        fn clipboard(&self) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "setClipboard"]
+        fn set_clipboard(&self, text: &QString);
+
+        /// A `linksy://pair` link as a QR code, an SVG data URL for an Image.
+        #[qinvokable]
+        #[cxx_name = "qrCode"]
+        fn qr_code(&self, text: &QString) -> QString;
+
+        /// Development aid (scripts/qt-shot.sh): save the window as an image.
+        #[qinvokable]
+        #[cxx_name = "saveWindow"]
+        fn save_window(&self, path: &QString) -> bool;
+
+        /// Play a session's stream (its socket) in the QML item named `item`; empty when it
+        /// plays, else why not ("missing-part" when a GStreamer piece is missing).
+        #[qinvokable]
+        #[cxx_name = "playStream"]
+        fn play_stream(&self, item: &QString, socket: &QString) -> QString;
+
+        /// Show what apps get from the Linksy Camera in the QML item named `item`; empty when
+        /// it plays, else why not.
+        #[qinvokable]
+        #[cxx_name = "previewCamera"]
+        fn preview_camera(&self, item: &QString) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "stopStream"]
+        fn stop_stream(&self);
+
+        /// "1920x1080" once frames arrive.
+        #[qinvokable]
+        #[cxx_name = "streamSize"]
+        fn stream_size(&self) -> QString;
+
+        /// A control message (JSON: pointer, button, scroll, key) to the screen's device.
+        #[qinvokable]
+        #[cxx_name = "sendControl"]
+        fn send_control(&self, json: &QString) -> bool;
+
+        /// Measure the phone's microphone as apps hear it, or stop.
+        #[qinvokable]
+        #[cxx_name = "meterMicrophone"]
+        fn meter_microphone(&self, on: bool);
+
+        /// How loud it got lately, 0 to 1; -1 when not measuring.
+        #[qinvokable]
+        #[cxx_name = "microphoneLevel"]
+        fn microphone_level(&self) -> f64;
+
+        /// Check what Finish Setup lists; `setupChecked` answers (JSON).
+        #[qinvokable]
+        #[cxx_name = "checkSetup"]
+        fn check_setup(self: Pin<&mut Self>);
+
+        /// Set up the items with these ids (a JSON list; empty: everything that can be),
+        /// one password; `setupStep` tells what it does, `setupFinished` how it ended.
+        #[qinvokable]
+        #[cxx_name = "runSetup"]
+        fn run_setup(self: Pin<&mut Self>, ids: &QString);
+
+        /// True once per version when something can be set up: open Finish Setup.
+        #[qinvokable]
+        #[cxx_name = "offerSetup"]
+        fn offer_setup(&self) -> bool;
+
+        /// What apps call a phone's camera.
+        #[qinvokable]
+        #[cxx_name = "cameraName"]
+        fn camera_name(&self, phone: &QString) -> QString;
+
+        #[qinvokable]
+        fn reboot(&self);
+
+        /// What's New as JSON ({version, notes, repo, highlights: [{icon, title, body}]}):
+        /// `any_time` for the menu (this version's), else after an update, once (empty
+        /// highlights when there's nothing to show).
+        #[qinvokable]
+        #[cxx_name = "whatsNew"]
+        fn whats_new(&self, any_time: bool) -> QString;
+
+        /// Look for a newer Linksy; `upgradeChecked` answers ({latest, current, notes,
+        /// manual} or {error}, or {} when this is the newest).
+        #[qinvokable]
+        #[cxx_name = "checkUpgrade"]
+        fn check_upgrade(self: Pin<&mut Self>);
+
+        /// Install what `checkUpgrade` found: `upgradeStep` tells each step,
+        /// `upgradeFinished` how it ended ({ok} or {error}).
+        #[qinvokable]
+        #[cxx_name = "runUpgrade"]
+        fn run_upgrade(self: Pin<&mut Self>);
+
+        #[qsignal]
+        #[cxx_name = "upgradeChecked"]
+        fn upgrade_checked(self: Pin<&mut Backend>, json: QString);
+
+        #[qsignal]
+        #[cxx_name = "upgradeStep"]
+        fn upgrade_step(self: Pin<&mut Backend>, text: QString);
+
+        #[qsignal]
+        #[cxx_name = "upgradeFinished"]
+        fn upgrade_finished(self: Pin<&mut Backend>, json: QString);
+
+        /// Write logs.txt (versions, crashes, the recent log) to `path`; `logsSaved` says
+        /// how it went (empty when saved, else why not).
+        #[qinvokable]
+        #[cxx_name = "saveLogs"]
+        fn save_logs(self: Pin<&mut Self>, path: &QString);
+
+        #[qsignal]
+        #[cxx_name = "logsSaved"]
+        fn logs_saved(self: Pin<&mut Backend>, error: QString);
+
+        /// Whether Linksy crashed since this was last asked (the logs are offered once).
+        #[qinvokable]
+        #[cxx_name = "unseenCrash"]
+        fn unseen_crash(&self) -> bool;
+
+        /// Linksy's languages: [{code, name}] (each in its own language).
+        #[qinvokable]
+        fn languages(&self) -> QString;
+
+        /// The language chosen in Preferences; empty: the system's.
+        #[qinvokable]
+        #[cxx_name = "chosenLanguage"]
+        fn chosen_language(&self) -> QString;
+
+        /// Choose a language (empty: the system's again), for the next start; empty when
+        /// saved, else why not.
+        #[qinvokable]
+        #[cxx_name = "chooseLanguage"]
+        fn choose_language(&self, code: &QString) -> QString;
+
+        /// This computer's address on the network, for "Pair by Address" elsewhere.
+        #[qinvokable]
+        #[cxx_name = "localAddress"]
+        fn local_address(&self, port: i32) -> QString;
+
+        /// Start Linksy again, the service too (not one started by hand).
+        #[qinvokable]
+        fn restart(self: Pin<&mut Self>);
+
+        /// Whether phones can be used by cable here: empty when they can, else why not.
+        #[qinvokable]
+        #[cxx_name = "usbReady"]
+        fn usb_ready(&self) -> QString;
+
+        /// Whether the service starts with every login; `autostartChecked` answers.
+        #[qinvokable]
+        #[cxx_name = "checkAutostart"]
+        fn check_autostart(self: Pin<&mut Self>);
+
+        /// Start the service with every login, or not; `autostartChecked` answers with how
+        /// it is then.
+        #[qinvokable]
+        #[cxx_name = "setAutostart"]
+        fn set_autostart(self: Pin<&mut Self>, on: bool);
+
+        /// 1 on, 0 off, -1 where Linksy can't change it; `error` when changing it failed.
+        #[qsignal]
+        #[cxx_name = "autostartChecked"]
+        fn autostart_checked(self: Pin<&mut Backend>, state: i32, error: QString);
+
+        #[qsignal]
+        #[cxx_name = "setupChecked"]
+        fn setup_checked(self: Pin<&mut Backend>, json: QString);
+
+        #[qsignal]
+        #[cxx_name = "setupStep"]
+        fn setup_step(self: Pin<&mut Backend>, text: QString);
+
+        /// {"ok": true} | {"error": "…"} | {"restart": "<steps>"}
+        #[qsignal]
+        #[cxx_name = "setupFinished"]
+        fn setup_finished(self: Pin<&mut Backend>, json: QString);
+
+        /// Linksy's own password prompt, where no polkit agent runs: whose password (as
+        /// polkit names them, maybe empty), and whether the last one didn't work. Answer
+        /// with answerPassword.
+        #[qsignal]
+        #[cxx_name = "passwordWanted"]
+        fn password_wanted(self: Pin<&mut Backend>, who: QString, again: bool);
+
+        /// The password passwordWanted asked for; `given` false: cancelled.
+        #[qinvokable]
+        #[cxx_name = "answerPassword"]
+        fn answer_password(&self, text: &QString, given: bool);
+
+        /// Whether the person chose to watch this phone rather than control it over the cable
+        /// (shared with the GTK app).
+        #[qinvokable]
+        #[cxx_name = "watchesOnly"]
+        fn watches_only(&self, device: &QString) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "setWatchesOnly"]
+        fn set_watches_only(&self, device: &QString, on: bool);
+
+        #[qsignal]
+        fn reply(self: Pin<&mut Backend>, id: i32, ok: bool, json: QString);
+
+        #[qsignal]
+        fn event(self: Pin<&mut Backend>, json: QString);
+
+        #[qsignal]
+        fn history(self: Pin<&mut Backend>, json: QString);
+
+        /// A phone's conversation changed: a message came in, was read or answered.
+        #[qsignal]
+        fn inbox(self: Pin<&mut Backend>, json: QString);
+
+        /// A copy from or to a phone went on, or ended (`fs_copy`, `fs_upload`).
+        #[qsignal]
+        #[cxx_name = "fsProgress"]
+        fn fs_progress(self: Pin<&mut Backend>, json: QString);
+
+        /// Couldn't reach the service, or it went away.
+        #[qsignal]
+        fn offline(self: Pin<&mut Backend>, why: QString);
+    }
+
+    impl cxx_qt::Threading for Backend {}
+}
+
+use std::pin::Pin;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use cxx_qt::{CxxQtType, Threading};
+use cxx_qt_lib::QString;
+use linksy_ipc::{Client, Request};
+use linksy_setup::{Failure, Need, Ui};
+
+pub struct BackendRust {
+    connected: bool,
+    starting: bool,
+    rt: tokio::runtime::Runtime,
+    client: Arc<Mutex<Option<Arc<Client>>>>,
+    next: AtomicI32,
+    /// What checkUpgrade found, for runUpgrade
+    upgrade: Arc<Mutex<Option<linksy_upgrade::Plan>>>,
+    /// Where answerPassword sends the password to
+    password: PasswordSlot,
+}
+
+type PasswordSlot = Arc<Mutex<Option<std::sync::mpsc::Sender<Option<String>>>>>;
+
+/// For the thread that runs pkexec: passwordWanted, then waits for answerPassword.
+fn asker(thread: cxx_qt::CxxQtThread<qobject::Backend>, slot: PasswordSlot) -> impl FnMut(&linksy_setup::Prompt) -> Option<String> + Send + 'static {
+    move |prompt: &linksy_setup::Prompt| {
+        let (answer, reply) = std::sync::mpsc::channel();
+        *slot.lock().unwrap() = Some(answer);
+        let (who, again) = (prompt.who.clone(), prompt.again);
+        thread.queue(move |b| b.password_wanted(QString::from(&who), again)).ok()?;
+        reply.recv().ok().flatten()
+    }
+}
+
+impl Default for BackendRust {
+    fn default() -> Self {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("linksy-ipc")
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        Self { connected: false, starting: false, rt, client: Arc::default(), next: AtomicI32::new(1), upgrade: Arc::default(), password: Arc::default() }
+    }
+}
+
+impl qobject::Backend {
+    pub fn start(mut self: Pin<&mut Self>) {
+        if *self.starting() {
+            return;
+        }
+        self.as_mut().set_starting(true);
+        let thread = self.qt_thread();
+        let slot = self.rust().client.clone();
+        self.rust().rt.spawn(async move {
+            let client = match connect().await {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    let _ = thread.queue(move |mut b| {
+                        b.as_mut().set_starting(false);
+                        b.as_mut().offline(QString::from(&e));
+                    });
+                    return;
+                }
+            };
+            *slot.lock().unwrap() = Some(client.clone());
+            let _ = thread.queue(|mut b| {
+                b.as_mut().set_starting(false);
+                b.as_mut().set_connected(true);
+            });
+            let (mut events, mut history, mut inbox, mut copies) = (client.events(), client.history_updates(), client.inbox_updates(), client.fs_progress());
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                tokio::select! {
+                    e = events.recv() => match e {
+                        Ok(e) => {
+                            let json = serde_json::to_string(&e).unwrap_or_default();
+                            let _ = thread.queue(move |b| b.event(QString::from(&json)));
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    },
+                    h = history.recv() => match h {
+                        Ok(h) => {
+                            let json = serde_json::to_string(&h).unwrap_or_default();
+                            let _ = thread.queue(move |b| b.history(QString::from(&json)));
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    },
+                    c = inbox.recv() => match c {
+                        Ok(c) => {
+                            let json = serde_json::to_string(&c).unwrap_or_default();
+                            let _ = thread.queue(move |b| b.inbox(QString::from(&json)));
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    },
+                    p = copies.recv() => match p {
+                        Ok(p) => {
+                            let json = serde_json::to_string(&p).unwrap_or_default();
+                            let _ = thread.queue(move |b| b.fs_progress(QString::from(&json)));
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    },
+                }
+            }
+            // The service went away.
+            *slot.lock().unwrap() = None;
+            let _ = thread.queue(|mut b| {
+                b.as_mut().set_connected(false);
+                b.as_mut().offline(QString::from(""));
+            });
+        });
+    }
+
+    pub fn call(self: Pin<&mut Self>, request: &QString) -> i32 {
+        let id = self.rust().next.fetch_add(1, Ordering::Relaxed);
+        let thread = self.qt_thread();
+        let client = self.rust().client.lock().unwrap().clone();
+        let request = request.to_string();
+        self.rust().rt.spawn(async move {
+            let result = match (client, serde_json::from_str::<Request>(&request)) {
+                (None, _) => Err("Linksy isn't running".to_string()),
+                (_, Err(e)) => Err(format!("bad request {request}: {e}")),
+                (Some(c), Ok(r)) => c.call::<serde_json::Value>(r).await.map_err(|e| e.to_string()),
+            };
+            let (ok, json) = match result {
+                Ok(v) => (true, v.to_string()),
+                Err(e) => (false, serde_json::Value::String(e).to_string()),
+            };
+            let _ = thread.queue(move |b| b.reply(id, ok, QString::from(&json)));
+        });
+        id
+    }
+
+    pub fn tr(&self, english: &QString) -> QString {
+        let english = english.to_string();
+        QString::from(linksy_i18n::lookup(&english))
+    }
+
+    pub fn env(&self, name: &QString) -> QString {
+        QString::from(&std::env::var(name.to_string()).unwrap_or_default())
+    }
+
+    pub fn version(&self) -> QString {
+        QString::from(env!("CARGO_PKG_VERSION"))
+    }
+
+    pub fn clipboard(&self) -> QString {
+        crate::app::ffi::clipboard_text()
+    }
+
+    pub fn set_clipboard(&self, text: &QString) {
+        crate::app::ffi::set_clipboard_text(text);
+    }
+
+    pub fn save_window(&self, path: &QString) -> bool {
+        crate::app::ffi::save_window(path)
+    }
+
+    pub fn play_stream(&self, item: &QString, socket: &QString) -> QString {
+        crate::app::ffi::play_stream(item, socket)
+    }
+
+    pub fn preview_camera(&self, item: &QString) -> QString {
+        // Read the camera as any app would: the Linksy Camera device, else the PipeWire camera.
+        // Development aid: LINKSY_TEST_CAMERA shows a test pattern instead.
+        let source = match linksy_setup::camera_device() {
+            _ if std::env::var_os("LINKSY_TEST_CAMERA").is_some() => "videotestsrc pattern=smpte ! video/x-raw,width=1280,height=720".to_string(),
+            Some(dev) => format!("v4l2src device={}", dev.display()),
+            None => "pipewiresrc target-object=linksy-camera always-copy=true".to_string(),
+        };
+        crate::app::ffi::play_source(item, &QString::from(&source))
+    }
+
+    pub fn stop_stream(&self) {
+        crate::app::ffi::stop_stream();
+    }
+
+    pub fn stream_size(&self) -> QString {
+        crate::app::ffi::stream_size()
+    }
+
+    pub fn send_control(&self, json: &QString) -> bool {
+        crate::app::ffi::send_control(json)
+    }
+
+    pub fn meter_microphone(&self, on: bool) {
+        crate::app::ffi::meter_microphone(on);
+    }
+
+    pub fn microphone_level(&self) -> f64 {
+        crate::app::ffi::microphone_level()
+    }
+
+    pub fn check_setup(self: Pin<&mut Self>) {
+        let thread = self.qt_thread();
+        // D-Bus and systemctl calls: off the Qt thread
+        self.rust().rt.spawn_blocking(move || {
+            let json = setup_json().to_string();
+            let _ = thread.queue(move |b| b.setup_checked(QString::from(&json)));
+        });
+    }
+
+    pub fn run_setup(self: Pin<&mut Self>, ids: &QString) {
+        let thread = self.qt_thread();
+        let ids: Vec<String> = serde_json::from_str(&ids.to_string()).unwrap_or_default();
+        let ask = asker(thread.clone(), self.rust().password.clone());
+        self.rust().rt.spawn_blocking(move || {
+            let items: Vec<_> = linksy_setup::actionable(&linksy_setup::check(Ui::Qt)).into_iter().filter(|i| ids.is_empty() || ids.iter().any(|id| id == i.id)).collect();
+            let args = linksy_setup::root_args(&items);
+            let step = |text: String| {
+                let _ = thread.queue(move |b| b.setup_step(QString::from(&text)));
+            };
+            let mut result = if args.is_empty() { Ok(()) } else { linksy_setup::run_as_root(&args, ask, step) };
+            if result.is_ok() && linksy_setup::wants_autostart(&items) {
+                result = linksy_setup::enable_autostart();
+            }
+            let json = match result {
+                Ok(()) => serde_json::json!({ "ok": true }),
+                Err(Failure::Message(m)) => serde_json::json!({ "error": m }),
+                Err(Failure::Restart(code)) => serde_json::json!({ "restart": linksy_setup::restart_steps(code.as_deref()) }),
+            }
+            .to_string();
+            let _ = thread.queue(move |b| b.setup_finished(QString::from(&json)));
+        });
+    }
+
+    pub fn offer_setup(&self) -> bool {
+        linksy_setup::offer_now(Ui::Qt, env!("CARGO_PKG_VERSION"))
+    }
+
+    pub fn camera_name(&self, phone: &QString) -> QString {
+        QString::from(&linksy_setup::camera_name(&phone.to_string()))
+    }
+
+    pub fn whats_new(&self, any_time: bool) -> QString {
+        let version = env!("CARGO_PKG_VERSION");
+        let news = if any_time { linksy_news::latest(version) } else { linksy_news::to_show(version) };
+        if !any_time && !news.is_empty() {
+            linksy_news::mark_seen(version);
+        }
+        // After skipped versions, each version's highlights under a heading ({heading} rows)
+        let several = news.len() > 1;
+        let highlights: Vec<_> = news
+            .iter()
+            .flat_map(|r| {
+                let heading = several.then(|| serde_json::json!({ "heading": r.version }));
+                heading.into_iter().chain(r.highlights.iter().map(|h| serde_json::json!({ "icon": h.qt, "title": h.title, "body": h.body })))
+            })
+            .collect();
+        let json = serde_json::json!({ "version": version, "several": several, "notes": linksy_news::notes_url(version), "repo": linksy_news::REPO, "highlights": highlights });
+        QString::from(&json.to_string())
+    }
+
+    pub fn save_logs(self: Pin<&mut Self>, path: &QString) {
+        let thread = self.qt_thread();
+        let path = std::path::PathBuf::from(path.to_string());
+        self.rust().rt.spawn_blocking(move || {
+            let error = match std::fs::write(&path, linksy_logs::collect(&linksy_upgrade::revision())) {
+                Ok(()) => String::new(),
+                Err(e) => e.to_string(),
+            };
+            let _ = thread.queue(move |b| b.logs_saved(QString::from(&error)));
+        });
+    }
+
+    pub fn unseen_crash(&self) -> bool {
+        linksy_logs::unseen_crash()
+    }
+
+    pub fn check_upgrade(self: Pin<&mut Self>) {
+        let thread = self.qt_thread();
+        let slot = self.rust().upgrade.clone();
+        self.rust().rt.spawn_blocking(move || {
+            let json = match linksy_upgrade::check() {
+                Ok(Some(plan)) => {
+                    let json = serde_json::json!({ "latest": plan.latest, "current": plan.current, "notes": plan.notes, "manual": linksy_upgrade::manual(&plan) });
+                    *slot.lock().unwrap() = Some(plan);
+                    json
+                }
+                Ok(None) => serde_json::json!({}),
+                Err(e) => serde_json::json!({ "error": e }),
+            }
+            .to_string();
+            let _ = thread.queue(move |b| b.upgrade_checked(QString::from(&json)));
+        });
+    }
+
+    pub fn run_upgrade(self: Pin<&mut Self>) {
+        let thread = self.qt_thread();
+        let Some(plan) = self.rust().upgrade.lock().unwrap().clone() else { return };
+        let ask = asker(thread.clone(), self.rust().password.clone());
+        self.rust().rt.spawn_blocking(move || {
+            let step = |text: String| {
+                let _ = thread.queue(move |b| b.upgrade_step(QString::from(&text)));
+            };
+            let json = match linksy_upgrade::run(&plan, linksy_upgrade::Root::Pkexec(Box::new(ask)), step) {
+                Ok(()) => serde_json::json!({ "ok": true }),
+                Err(e) => serde_json::json!({ "error": e }),
+            }
+            .to_string();
+            let _ = thread.queue(move |b| b.upgrade_finished(QString::from(&json)));
+        });
+    }
+
+    pub fn watches_only(&self, device: &QString) -> bool {
+        linksy_setup::watches_only(&device.to_string())
+    }
+
+    pub fn set_watches_only(&self, device: &QString, on: bool) {
+        linksy_setup::set_watches_only(&device.to_string(), on);
+    }
+
+    pub fn answer_password(&self, text: &QString, given: bool) {
+        if let Some(answer) = self.rust().password.lock().unwrap().take() {
+            let _ = answer.send(given.then(|| text.to_string()));
+        }
+    }
+
+    pub fn languages(&self) -> QString {
+        let list: Vec<_> = linksy_i18n::LANGUAGES.iter().map(|(code, name)| serde_json::json!({ "code": code, "name": name })).collect();
+        QString::from(&serde_json::Value::from(list).to_string())
+    }
+
+    pub fn chosen_language(&self) -> QString {
+        QString::from(&linksy_i18n::chosen().unwrap_or_default())
+    }
+
+    pub fn choose_language(&self, code: &QString) -> QString {
+        let code = code.to_string();
+        match linksy_i18n::choose(Some(code.as_str()).filter(|c| !c.is_empty())) {
+            Ok(()) => QString::default(),
+            Err(e) => QString::from(&e.to_string()),
+        }
+    }
+
+    pub fn local_address(&self, port: i32) -> QString {
+        let ip = std::net::UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {
+            // Nothing is sent: connecting a UDP socket only picks the route
+            s.connect("192.0.2.1:9").ok()?;
+            Some(s.local_addr().ok()?.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        });
+        let Some(ip) = ip else { return QString::default() };
+        let shown = if port == 47_200 || port <= 0 { ip.to_string() } else { std::net::SocketAddr::new(ip, port as u16).to_string() };
+        QString::from(&shown)
+    }
+
+    pub fn restart(self: Pin<&mut Self>) {
+        // A service started by hand (LINKSY_SOCKET, development) is left running
+        let client = self.rust().client.lock().unwrap().clone().filter(|_| !linksy_ipc::custom_socket());
+        let thread = self.qt_thread();
+        self.rust().rt.spawn(async move {
+            if let Some(c) = client {
+                let _ = tokio::time::timeout(Duration::from_secs(3), c.quit()).await;
+                // Wait for it to go, so the new window starts a new one
+                for _ in 0..20 {
+                    if std::fs::metadata(linksy_ipc::socket_path()).is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            }
+            // Once this process has ended (and let go of the single-instance socket)
+            linksy_upgrade::relaunch();
+            let _ = thread.queue(|_| crate::app::ffi::quit_app());
+        });
+    }
+
+    pub fn usb_ready(&self) -> QString {
+        QString::from(&linksy_setup::usb_ready().err().unwrap_or_default())
+    }
+
+    pub fn check_autostart(self: Pin<&mut Self>) {
+        let thread = self.qt_thread();
+        // systemctl: off the Qt thread
+        self.rust().rt.spawn_blocking(move || {
+            let state = autostart_state();
+            let _ = thread.queue(move |b| b.autostart_checked(state, QString::default()));
+        });
+    }
+
+    pub fn set_autostart(self: Pin<&mut Self>, on: bool) {
+        let thread = self.qt_thread();
+        self.rust().rt.spawn_blocking(move || {
+            let error = linksy_setup::set_autostart(on).err().unwrap_or_default();
+            let state = autostart_state();
+            let _ = thread.queue(move |b| b.autostart_checked(state, QString::from(&error)));
+        });
+    }
+
+    pub fn reboot(&self) {
+        // elogind's where there's no systemd (Artix, Void)
+        let _ = std::process::Command::new("sh").args(["-c", "if [ -d /run/systemd/system ]; then systemctl reboot; else loginctl reboot; fi"]).spawn();
+    }
+
+    pub fn qr_code(&self, text: &QString) -> QString {
+        let Ok(code) = qrcode::QrCode::new(text.to_string().as_bytes()) else { return QString::default() };
+        let width = code.width();
+        let mut path = String::new();
+        for (i, c) in code.to_colors().iter().enumerate() {
+            if *c == qrcode::Color::Dark {
+                path.push_str(&format!("M{} {}h1v1h-1z", i % width, i / width));
+            }
+        }
+        // A quiet zone of 2 modules, as scanners like.
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='-2 -2 {s} {s}' shape-rendering='crispEdges'><rect x='-2' y='-2' width='{s}' height='{s}' fill='white'/><path d='{path}' fill='black'/></svg>",
+            s = width + 4
+        );
+        QString::from(&format!("data:image/svg+xml;utf8,{}", svg.replace('#', "%23")))
+    }
+}
+
+fn autostart_state() -> i32 {
+    linksy_setup::autostart().map_or(-1, i32::from)
+}
+
+/// Finish Setup's list for QML: each item, what it needs, and the terminal command.
+fn setup_json() -> serde_json::Value {
+    let items = linksy_setup::check(Ui::Qt);
+    let list: Vec<_> = items
+        .iter()
+        .map(|i| {
+            let (need, note) = match &i.need {
+                Need::Ready => ("ready", None),
+                Need::SetUp => ("setup", None),
+                Need::Install(_) => match linksy_setup::layered_hint(i.why) {
+                    Some(hint) => ("manual", Some(hint)),
+                    None => ("install", None),
+                },
+                Need::Manual(what) => ("manual", Some(format!("{} {what}", i.why))),
+            };
+            serde_json::json!({ "id": i.id, "title": i.title, "why": note.unwrap_or_else(|| i.why.to_string()), "need": need })
+        })
+        .collect();
+    serde_json::json!({
+        "items": list,
+        "missing": linksy_setup::missing(&items),
+        "everything": linksy_setup::actionable(&items).len(),
+        "command": linksy_setup::terminal_command(&items),
+        "byHand": linksy_setup::BY_HAND,
+    })
+}
+
+/// The service's socket; when nobody answers, start the service (its systemd unit when
+/// installed, else `linksyd` next to this app or on PATH) and wait for it.
+async fn connect() -> Result<Client, String> {
+    if let Ok(c) = Client::connect().await {
+        return Ok(c);
+    }
+    // Pointed at a particular service (development): that one is started by hand.
+    if linksy_ipc::custom_socket() {
+        return Err(String::new());
+    }
+    use std::process::{Command, Stdio};
+    let via_systemd = Command::new("systemctl")
+        .args(["--user", "start", "linksyd.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !via_systemd {
+        let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("linksyd"))).filter(|p| p.exists());
+        Command::new(beside.unwrap_or_else(|| "linksyd".into()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| linksy_i18n::t!("Could not start the service: {error}", error = e))?;
+    }
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if let Ok(c) = Client::connect().await {
+            return Ok(c);
+        }
+    }
+    Err(String::new())
+}

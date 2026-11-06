@@ -1,0 +1,623 @@
+//! `linksy`: command-line front end for the Linksy service.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use linksy_ipc::linksy_core::{DeviceKind, Direction, Event};
+use linksy_ipc::{Client, ClientError};
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+const HELP: &str = "linksy — share between your devices
+
+Usage:
+  linksy devices                     paired and nearby devices
+  linksy pair <device|ip:port>       pair with a device (both screens show a code)
+  linksy pair <linksy://pair?…>      pair using another device's QR code link
+  linksy invite                      show a QR code another device can scan to pair
+  linksy history [device]            what was shared, newest first
+  linksy extend <device>             use another device as a second display
+  linksy camera <device>             use another device's camera as a webcam here
+  linksy mic <device>                use another device's microphone as a microphone here
+  linksy screen <device> --record FILE [--seconds N]
+                                     save another device's screen as H.264
+  linksy send <device> <files…>      send files or folders
+  linksy notify <device> <title> [body]
+  linksy clip <device> [text]        share text to its clipboard (default: stdin)
+  linksy open <device> <url>         open a web link in its browser
+  linksy ring <device> [--stop]      make it ring so you can find it
+  linksy locate <phone>              ask a phone where it is (it can say no)
+  linksy terminal                    terminals for phones: code set, allowed, running
+  linksy terminal code               set the code a phone types to open a terminal here
+  linksy terminal allow|deny <phone> let a phone open terminals here, or stop it
+  linksy terminal unlock <phone>     after too many wrong codes
+  linksy terminal end <id>           end a running terminal
+  linksy files <phone>               open a phone's files in the file manager
+  linksy inbox [conversation]        messages from the phones' notifications
+  linksy reply <conversation> <text> answer one through the phone
+  linksy texts <phone> [thread]      a phone's conversations, or one conversation
+  linksy text <phone> <number> <message…>
+                                     send a text through a phone
+  linksy forget <device>             unpair a device
+  linksy settings [key value]        show or change: name, download-dir,
+                                     auto-accept on|off, stay-connected on|off,
+                                     away on|off (off: no relay at all),
+                                     relay https://…|default (your own relay)
+  linksy watch                       follow activity and answer requests
+  linksy status                      this device
+  linksy upgrade [-y]                install the newest Linksy, then restart it
+  linksy --version                   Linksy's version (and the service's, if it differs)
+  linksy --revision                  the exact build, for bug reports
+  linksy logs > logs.txt             versions, crashes and the recent log, for a bug report
+
+<device> is a name, a short id like A1B2-C3D4, or a full id.";
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(cmd) = args.first().map(String::as_str) else {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    };
+    if matches!(cmd, "-h" | "--help" | "help") {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
+    // These work without the service
+    match cmd {
+        "-V" | "--version" | "version" => return version().await,
+        "--revision" | "revision" => {
+            println!("Linksy {}", linksy_upgrade::revision());
+            return ExitCode::SUCCESS;
+        }
+        "logs" => {
+            print!("{}", linksy_logs::collect(&linksy_upgrade::revision()));
+            return ExitCode::SUCCESS;
+        }
+        "upgrade" | "update" => return upgrade(args[1..].iter().any(|a| a == "-y" || a == "--yes")),
+        _ => {}
+    }
+    let client = match Client::connect().await {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("Linksy service is not running. Start it with `linksyd` or `systemctl --user start linksyd`.");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run(&client, cmd, &args[1..]).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `linksy --version`: this one's, and the running service's when it differs (an upgrade
+/// installed, but the service not restarted yet).
+async fn version() -> ExitCode {
+    println!("Linksy {}", linksy_upgrade::VERSION);
+    if let Ok(c) = Client::connect().await
+        && let Ok(s) = c.status().await
+        && !s.version.is_empty()
+        && s.version != linksy_upgrade::VERSION
+    {
+        println!("The running service is {}: restart it with `systemctl --user restart linksyd`.", s.version);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `linksy upgrade`: the newest version, checked and installed, then Linksy restarted.
+fn upgrade(yes: bool) -> ExitCode {
+    println!("Checking for a newer Linksy…");
+    let plan = match linksy_upgrade::check() {
+        Ok(Some(plan)) => plan,
+        Ok(None) => {
+            println!("Linksy {} is the newest version.", linksy_upgrade::VERSION);
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Linksy {} is available (this is {}).", plan.latest, plan.current);
+    if let Some(notes) = &plan.notes {
+        println!("What's new: {notes}");
+    }
+    if let Some(why) = linksy_upgrade::manual(&plan) {
+        println!("{why}");
+        return ExitCode::FAILURE;
+    }
+    println!("It installs: {}", plan.files.join(", "));
+    if !yes {
+        print!("Upgrade now? [Y/n] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        if answer.trim().to_lowercase().starts_with('n') {
+            return ExitCode::SUCCESS;
+        }
+    }
+    match linksy_upgrade::run(&plan, linksy_upgrade::Root::Sudo, |step| println!("  {step}…")) {
+        Ok(()) if std::env::var_os("LINKSY_DRY_RUN").is_some() => {
+            println!("Dry run: nothing was installed.");
+            ExitCode::SUCCESS
+        }
+        Ok(()) => {
+            println!("Linksy {} is installed and its service restarted. If Linksy's window is open, close it and open it again.", plan.latest);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(c: &Client, cmd: &str, rest: &[String]) -> Result<(), String> {
+    let err = |e: ClientError| e.to_string();
+    match (cmd, rest) {
+        ("status", []) => {
+            let s = c.status().await.map_err(err)?;
+            println!("{} ({})", s.device.name, s.device.id.short());
+            println!("Port      {}", s.port);
+            println!("Saves to  {}", s.download_dir.display());
+        }
+        ("devices", []) => {
+            let devices = c.devices().await.map_err(err)?;
+            if devices.is_empty() {
+                println!("No devices yet. Open Linksy on another device on this network.");
+            }
+            for d in devices {
+                let state = match (d.trusted, d.connected, d.nearby) {
+                    (true, true, _) if d.usb => "connected by USB",
+                    (true, true, _) if d.away => "connected away from home",
+                    (true, true, _) => "connected",
+                    (true, false, true) => "paired · nearby",
+                    (true, false, false) => "paired · not nearby",
+                    (false, _, _) => "nearby · not paired",
+                };
+                let battery = d.battery.map(|b| format!(" · {}%{}", b.level, if b.charging { " charging" } else { "" })).unwrap_or_default();
+                println!("{:<24} {:<8} {}  {state}{battery}", d.device.name, kind_name(d.device.kind), d.device.id.short());
+            }
+        }
+        ("pair", [target]) => {
+            let mut events = c.events();
+            let pair = c.pair(target.clone());
+            tokio::pin!(pair);
+            loop {
+                tokio::select! {
+                    r = &mut pair => {
+                        let d = r.map_err(err)?;
+                        println!("Paired with {}.", d.name);
+                        return Ok(());
+                    }
+                    Ok(ev) = events.recv() => {
+                        if let Event::PairingRequest { request, device, code, incoming: false, .. } = ev {
+                            println!("Pairing code: {} {}", &code[..3], &code[3..]);
+                            let ok = ask(&format!("Does {} show the same code?", device.name)).await;
+                            c.respond(request, ok).await.map_err(err)?;
+                        }
+                    }
+                }
+            }
+        }
+        ("send", [to, files @ ..]) if !files.is_empty() => {
+            let paths = files
+                .iter()
+                .map(|f| std::fs::canonicalize(f).map_err(|e| format!("{f}: {e}")))
+                .collect::<Result<Vec<PathBuf>, _>>()?;
+            let mut events = c.events();
+            let id = c.send(to.clone(), paths).await.map_err(err)?;
+            println!("Waiting for {to} to accept…");
+            loop {
+                match events.recv().await {
+                    Ok(Event::TransferProgress { transfer, bytes, total }) if transfer == id => {
+                        let pct = (bytes * 100).checked_div(total).unwrap_or(100);
+                        print!("\r{} {pct:>3}%  {} of {}", bar(pct), size(bytes), size(total));
+                        let _ = std::io::stdout().flush();
+                    }
+                    Ok(Event::TransferComplete { transfer, .. }) if transfer == id => {
+                        println!("\nSent.");
+                        return Ok(());
+                    }
+                    Ok(Event::TransferFailed { transfer, reason }) if transfer == id => {
+                        println!();
+                        return Err(if reason == "request was declined" { format!("{to} declined.") } else { reason });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(err(ClientError::Disconnected)),
+                    _ => {}
+                }
+            }
+        }
+        ("notify", [to, title, body @ ..]) if body.len() <= 1 => {
+            c.notify(to.clone(), title.clone(), body.first().cloned().unwrap_or_default()).await.map_err(err)?;
+        }
+        ("files", [phone]) => {
+            let uri = c.browse_files(phone.clone()).await.map_err(err)?;
+            println!("{phone}'s files: {uri}");
+        }
+        ("texts", [phone]) => {
+            for t in c.sms_threads(phone.clone()).await.map_err(err)? {
+                let who = if t.names.iter().any(|n| !n.is_empty()) { t.names.join(", ") } else { t.addresses.join(", ") };
+                println!("{:>6}  {}{who}: {}", t.id, if t.unread { "* " } else { "" }, t.snippet);
+            }
+        }
+        ("texts", [phone, thread]) => {
+            let (mut messages, _) = c.sms_messages(phone.clone(), thread.clone(), None).await.map_err(err)?;
+            messages.reverse();
+            for m in messages {
+                println!("{} {}", if m.from_me { "me:  " } else { "them:" }, m.body);
+            }
+        }
+        ("inbox", []) => {
+            for v in c.inbox().await.map_err(err)? {
+                let last = v.last.map(|m| format!("{}{}", m.sender.map(|s| format!("{s}: ")).unwrap_or_default(), m.text)).unwrap_or_default();
+                let unread = if v.unread > 0 { format!(" ({})", v.unread) } else { String::new() };
+                println!("{}  {} · {}{unread}: {last}", v.id, v.app_name, v.title);
+            }
+        }
+        ("inbox", [id]) => {
+            for m in c.inbox_thread(id.clone()).await.map_err(err)? {
+                let who = if m.mine { "me".to_string() } else { m.sender.unwrap_or_else(|| "them".into()) };
+                let code = m.code.map(|c| format!("  [code {c}]")).unwrap_or_default();
+                println!("{who}: {}{code}", m.text);
+            }
+        }
+        ("reply", [id, words @ ..]) if !words.is_empty() => {
+            c.inbox_reply(id.clone(), words.join(" ")).await.map_err(err)?;
+            println!("Sent.");
+        }
+        ("text", [phone, number, words @ ..]) if !words.is_empty() => {
+            c.sms_send(phone.clone(), vec![number.clone()], words.join(" ")).await.map_err(err)?;
+            println!("Sent.");
+        }
+        ("ring", [to]) => {
+            c.ring(to.clone(), true).await.map_err(err)?;
+            println!("Ringing {to}. Stop it with: linksy ring {to} --stop");
+        }
+        ("ring", [to, stop]) if stop == "--stop" => c.ring(to.clone(), false).await.map_err(err)?,
+        ("locate", [phone]) => {
+            println!("Asking {phone} where it is…");
+            let l = c.locate(phone.clone()).await.map_err(err)?;
+            let accuracy = l.accuracy_m.map(|a| format!(", within {a:.0} m")).unwrap_or_default();
+            println!("{phone} is at {:.5}, {:.5}{accuracy}", l.lat, l.lon);
+            println!("https://www.openstreetmap.org/?mlat={:.5}&mlon={:.5}#map=17/{:.5}/{:.5}", l.lat, l.lon, l.lat, l.lon);
+        }
+        ("terminal", []) => {
+            let t = c.terminal_status().await.map_err(err)?;
+            println!("Code: {}", if t.code_set { "set" } else { "not set (terminals are off)" });
+            let name = |id: &linksy_ipc::linksy_core::Fingerprint| id.short();
+            println!("Allowed: {}", if t.allowed.is_empty() { "none".into() } else { t.allowed.iter().map(name).collect::<Vec<_>>().join(", ") });
+            if !t.locked.is_empty() {
+                println!("Locked: {}", t.locked.iter().map(name).collect::<Vec<_>>().join(", "));
+            }
+            for r in &t.running {
+                println!("{}  {}  {}{}", r.id, r.device.short(), r.title, if r.attached { "" } else { "  (detached)" });
+            }
+        }
+        ("terminal", [what]) if what == "code" => {
+            let code = std::env::var("LINKSY_TERMINAL_CODE").ok().or_else(|| {
+                eprint!("New terminal code (6+ characters): ");
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).ok()?;
+                Some(line.trim().to_string())
+            });
+            c.set_terminal_code(code).await.map_err(err)?;
+            println!("Terminal code set.");
+        }
+        ("terminal", [what, phone]) if what == "allow" || what == "deny" => {
+            c.allow_terminal(phone, what == "allow").await.map_err(err)?;
+            println!("{} {phone}.", if what == "allow" { "Terminals allowed for" } else { "Terminals no longer allowed for" });
+        }
+        ("terminal", [what, phone]) if what == "unlock" => {
+            c.unlock_terminal(phone).await.map_err(err)?;
+            println!("Unlocked for {phone}.");
+        }
+        ("terminal", [what, id]) if what == "end" => {
+            c.end_terminal(id).await.map_err(err)?;
+            println!("Ended.");
+        }
+        ("open", [to, url]) => {
+            c.open_url(to.clone(), url.clone()).await.map_err(err)?;
+            println!("Opened on {to}.");
+        }
+        ("clip", [to, text @ ..]) => {
+            let text = if text.is_empty() {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| e.to_string())?;
+                buf
+            } else {
+                text.join(" ")
+            };
+            c.send_clipboard(to.clone(), text).await.map_err(err)?;
+            println!("Shared clipboard with {to}.");
+        }
+        ("invite", []) => {
+            let uri = c.create_invite().await.map_err(err)?;
+            let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| e.to_string())?;
+            let art = code
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                .quiet_zone(true)
+                .build();
+            println!("{art}\nScan with Linksy on your phone, or on another computer run:\n  linksy pair '{uri}'\n");
+            println!("Waiting (valid 5 minutes). Press Ctrl+C to cancel.");
+            let mut events = c.events();
+            let outcome = tokio::select! {
+                _ = tokio::signal::ctrl_c() => None,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => None,
+                d = async {
+                    loop {
+                        match events.recv().await {
+                            Ok(Event::Paired { device }) => return Some(device),
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                            _ => {}
+                        }
+                    }
+                } => d,
+            };
+            let _ = c.cancel_invite().await;
+            match outcome {
+                Some(d) => println!("Paired with {}.", d.name),
+                None => return Err("No device paired.".into()),
+            }
+        }
+        ("history", with) if with.len() <= 1 => {
+            let entries = c.history(with.first().cloned()).await.map_err(err)?;
+            if entries.is_empty() {
+                println!("Nothing shared yet.");
+            }
+            for e in entries.iter().take(50) {
+                use linksy_ipc::{HistoryStatus, Shared};
+                let arrow = if e.direction == Direction::Incoming { "←" } else { "→" };
+                let what = match &e.what {
+                    Shared::Files { files, total, import: true, .. } => format!("imported {} photos ({})", files.len(), size(*total)),
+                    Shared::Files { files, total, .. } => match files.as_slice() {
+                        [one] => format!("{one} ({})", size(*total)),
+                        many => format!("{} ({})", plural(many.len(), "item"), size(*total)),
+                    },
+                    Shared::Clipboard { text } if text.is_empty() => "clipboard text".into(),
+                    Shared::Clipboard { text } => format!("clipboard: {}", text.chars().take(40).collect::<String>()),
+                    Shared::Ping { title, .. } => format!("ping: {title}"),
+                    Shared::Link { url } => format!("link: {url}"),
+                    Shared::Locked => "locked this computer when it left".into(),
+                    Shared::Remote { seconds } => format!("touchpad and keyboard ({seconds} s)"),
+                    Shared::Camera { seconds } if e.direction == Direction::Incoming => format!("used their camera ({seconds} s)"),
+                    Shared::Camera { seconds } => format!("shared this camera ({seconds} s)"),
+                    Shared::Microphone { seconds } if e.direction == Direction::Incoming => format!("used their microphone ({seconds} s)"),
+                    Shared::Microphone { seconds } => format!("shared this microphone ({seconds} s)"),
+                    Shared::Terminal { seconds } => format!("a terminal here ({seconds} s)"),
+                    Shared::Screen { seconds, display: true } => format!("second display ({seconds} s)"),
+                    Shared::Screen { seconds, .. } if e.direction == Direction::Incoming => format!("watched their screen ({seconds} s)"),
+                    Shared::Screen { seconds, .. } => format!("shared this screen ({seconds} s)"),
+                };
+                let status = match &e.status {
+                    HistoryStatus::InProgress => "in progress".to_string(),
+                    HistoryStatus::Done => String::new(),
+                    HistoryStatus::Declined => "declined".into(),
+                    HistoryStatus::Cancelled => "cancelled".into(),
+                    HistoryStatus::Failed { reason } => format!("failed: {reason}"),
+                };
+                println!("{arrow} {:<18} {what}  {status}", e.peer_name);
+            }
+        }
+        ("extend" | "camera" | "mic", [to]) => {
+            use linksy_ipc::linksy_core::SessionKind;
+            let kind = match cmd {
+                "camera" => SessionKind::Camera,
+                "mic" => SessionKind::Microphone,
+                _ => SessionKind::Display,
+            };
+            println!("Asking {to}…");
+            let info = c.start_session(to.clone(), kind).await.map_err(err)?;
+            match kind {
+                SessionKind::Camera => println!("{to}'s camera is on: pick \"Linksy Camera ({to})\" in your apps. Press Ctrl+C to stop."),
+                SessionKind::Microphone => println!("{to}'s microphone is on: pick \"Linksy Microphone ({to})\" in your apps. Press Ctrl+C to stop."),
+                _ => println!("{to} is now a second display. Press Ctrl+C to stop."),
+            }
+            let mut events = c.events();
+            let ended = async {
+                while let Ok(e) = events.recv().await {
+                    if matches!(e, Event::SessionEnded { session } if session == info.session) {
+                        return;
+                    }
+                }
+            };
+            // Stopped by Ctrl+C or by a SIGTERM: either way, end the session first.
+            // I hope this doesn't break. It hasn't yet.
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| e.to_string())?;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+                _ = ended => println!("{to} stopped."),
+            }
+            let _ = c.end_session(info.session).await;
+        }
+        ("screen", [to, flag, file, rest @ ..]) if flag == "--record" => {
+            let seconds: u64 = match rest {
+                [] => 10,
+                [f, n] if f == "--seconds" => n.parse().map_err(|_| "--seconds needs a number")?,
+                _ => return Err("Usage: linksy screen <device> --record FILE [--seconds N]".into()),
+            };
+            println!("Asking {to} to share its screen…");
+            let info = c.start_session(to.clone(), linksy_ipc::linksy_core::SessionKind::Screen).await.map_err(err)?;
+            let socket = info.socket.ok_or("no stream to record")?;
+            let mut stream = tokio::net::UnixStream::connect(&socket).await.map_err(|e| e.to_string())?;
+            let mut out = tokio::fs::File::create(file).await.map_err(|e| format!("{file}: {e}"))?;
+            println!("Recording for {seconds} s…");
+            let copied = tokio::time::timeout(std::time::Duration::from_secs(seconds), tokio::io::copy(&mut stream, &mut out)).await;
+            let _ = c.end_session(info.session).await;
+            let bytes = match copied {
+                Ok(r) => r.map_err(|e| e.to_string())?,
+                Err(_) => out.metadata().await.map(|m| m.len()).unwrap_or(0),
+            };
+            println!("Saved {} to {file}. Play it with: gst-play-1.0 {file}", size(bytes));
+        }
+        ("settings", []) => {
+            let s = c.settings().await.map_err(err)?;
+            println!("name            {}", s.name);
+            println!("download-dir    {}", s.download_dir.display());
+            println!("auto-accept     {}", on_off(s.auto_accept));
+            println!("stay-connected  {}", on_off(s.stay_connected));
+            println!("away            {}", on_off(s.away));
+            println!("relay           {}", s.relay.as_deref().unwrap_or("default"));
+        }
+        ("settings", [key, value @ ..]) if !value.is_empty() => {
+            let mut s = c.settings().await.map_err(err)?;
+            let value = value.join(" ");
+            let flag = || match value.as_str() {
+                "on" | "yes" | "true" => Ok(true),
+                "off" | "no" | "false" => Ok(false),
+                _ => Err(format!("{key} takes on or off")),
+            };
+            match key.as_str() {
+                "name" => s.name = value.clone(),
+                "download-dir" => {
+                    s.download_dir = std::path::absolute(&value).map_err(|e| format!("{value}: {e}"))?;
+                }
+                "auto-accept" => s.auto_accept = flag()?,
+                "stay-connected" => s.stay_connected = flag()?,
+                // Off: no contact with the relay at all
+                "away" => s.away = flag()?,
+                // Away from home goes through this relay instead of Linksy's own.
+                "relay" => s.relay = (value != "default").then(|| value.clone()),
+                other => return Err(format!("Unknown setting {other}. Run `linksy help`.")),
+            }
+            let s = c.update_settings(s).await.map_err(err)?;
+            println!("Saved. This device is \"{}\".", s.name);
+        }
+        ("forget", [target]) => {
+            if c.forget(target.clone()).await.map_err(err)? {
+                println!("Forgot {target}.");
+            } else {
+                println!("{target} was not paired.");
+            }
+        }
+        ("watch", []) => watch(c).await?,
+        _ => return Err("Unknown command. Run `linksy help`.".to_string()),
+    }
+    Ok(())
+}
+
+async fn watch(c: &Client) -> Result<(), String> {
+    let mut events = c.events();
+    println!("Watching. Press Ctrl+C to stop.");
+    loop {
+        let ev = match events.recv().await {
+            Ok(ev) => ev,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => return Err(ClientError::Disconnected.to_string()),
+        };
+        match ev {
+            Event::DeviceFound { device, .. } => println!("· {} is nearby", device.name),
+            Event::DeviceLost { id } => println!("· {} left", id.short()),
+            Event::Connected { device } => println!("● {} connected", device.name),
+            Event::Disconnected { id } => println!("○ {} disconnected", id.short()),
+            Event::PairingRequest { request, device, code, incoming: true, .. } => {
+                println!("{} wants to pair. Code: {} {}", device.name, &code[..3], &code[3..]);
+                let ok = ask("Does the other screen show the same code?").await;
+                let _ = c.respond(request, ok).await;
+            }
+            Event::Paired { device } => println!("✓ Paired with {}", device.name),
+            Event::PairingFailed { device, reason } => println!("✗ Pairing with {} failed: {reason}", device.name),
+            Event::TransferRequest { transfer, from, files, total, .. } => {
+                println!("{} wants to send {} ({}):", from.name, plural(files.len(), "item"), size(total));
+                for f in files.iter().take(5) {
+                    println!("    {}", f.path);
+                }
+                if files.len() > 5 {
+                    println!("    …and {} more", files.len() - 5);
+                }
+                let ok = ask("Accept?").await;
+                let _ = c.respond(transfer, ok).await;
+            }
+            Event::TransferStarted { peer, direction, total, .. } => {
+                let verb = if direction == Direction::Incoming { "Receiving from" } else { "Sending to" };
+                println!("↕ {verb} {} ({})", peer.name, size(total));
+            }
+            Event::TransferComplete { saved, .. } if !saved.is_empty() => {
+                for p in saved {
+                    println!("✓ Saved {}", p.display());
+                }
+            }
+            Event::TransferFailed { reason, .. } => println!("✗ Transfer failed: {reason}"),
+            Event::Notification { from, title, body } => println!("Ping from {}: {title} {body}", from.name),
+            Event::Clipboard { from, text } => println!("Clipboard from {}: {text}", from.name),
+            Event::OpenUrl { from, url } => println!("Link from {}: {url}", from.name),
+            Event::Battery { from, battery } => {
+                println!("{} battery: {}%{}", from.name, battery.level, if battery.charging { ", charging" } else { "" })
+            }
+            Event::Ring { from, on: true } => println!("{} is looking for this device", from.name),
+            Event::CallState { from, state, contact } => println!("Call on {}: {state:?}{}", from.name, contact.map(|c| format!(" ({c})")).unwrap_or_default()),
+            Event::MediaState { from, state } => {
+                for p in &state.players {
+                    println!("Playing on {} ({}): {} – {}{}", from.name, p.app, p.artist, p.title, if p.playing { "" } else { " (paused)" });
+                }
+            }
+            Event::SmsMessage { from, message, .. } if !message.from_me => println!("Text on {} from {}: {}", from.name, message.address, message.body),
+            Event::NotificationPosted { from, notification: n } => println!("Notification from {} ({}): {}: {}", from.name, n.app_name, n.title, n.body),
+            Event::SessionRequest { request, from, kind } => {
+                match kind {
+                    linksy_ipc::linksy_core::SessionKind::Control => println!("{} wants to control your screen (mouse and keyboard).", from.name),
+                    linksy_ipc::linksy_core::SessionKind::Screen => println!("{} wants to see your screen.", from.name),
+                    linksy_ipc::linksy_core::SessionKind::Display => println!("{} wants to use this screen as a second display.", from.name),
+                    linksy_ipc::linksy_core::SessionKind::Camera => println!("{} wants to use your camera.", from.name),
+                    linksy_ipc::linksy_core::SessionKind::Input => println!("{} wants to use your mouse and keyboard.", from.name),
+                    linksy_ipc::linksy_core::SessionKind::Microphone => println!("{} wants to use your microphone.", from.name),
+                    linksy_ipc::linksy_core::SessionKind::Terminal => println!("{} wants a terminal on this computer (the right code was typed).", from.name),
+                }
+                let ok = ask("Allow?").await;
+                let _ = c.respond(request, ok).await;
+            }
+            Event::SessionStarted { peer, kind: linksy_ipc::linksy_core::SessionKind::Input, .. } => println!("{} is your touchpad and keyboard", peer.name),
+            Event::SessionStarted { peer, kind: linksy_ipc::linksy_core::SessionKind::Terminal, .. } => println!("{} has a terminal open here", peer.name),
+            Event::SessionStarted { peer, sharing: true, .. } => println!("Sharing your screen with {}", peer.name),
+            Event::SessionEnded { .. } => println!("Session ended"),
+            _ => {}
+        }
+    }
+}
+
+async fn ask(question: &str) -> bool {
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = BufReader::new(tokio::io::stdin()).read_line(&mut line).await;
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+fn kind_name(kind: DeviceKind) -> &'static str {
+    match kind {
+        DeviceKind::Desktop => "desktop",
+        DeviceKind::Laptop => "laptop",
+        DeviceKind::Phone => "phone",
+        DeviceKind::Tablet => "tablet",
+    }
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
+fn bar(pct: u64) -> String {
+    let filled = (pct / 5) as usize;
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(20 - filled.min(20)))
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
+}
+
+fn size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1000.0 && unit < UNITS.len() - 1 {
+        v /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[unit]) }
+}

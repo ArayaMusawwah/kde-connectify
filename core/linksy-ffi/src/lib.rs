@@ -11,7 +11,7 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use linksy_core::{Config, Event, Fingerprint, Node, Session};
-use linksy_core::protocol::SessionKind;
+use linksy_core::protocol::{SessionKind, MediaCommand, CommandEntry};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +189,7 @@ pub unsafe extern "C" fn linksy_node_new(
 
     let mut events = node.subscribe();
     let cb_clone = callbacks.clone();
+    let node_events = node.clone();
 
     rt.spawn(async move {
         loop {
@@ -199,7 +200,7 @@ pub unsafe extern "C" fn linksy_node_new(
                 ev_res = events.recv() => {
                     match ev_res {
                         Ok(event) => {
-                            dispatch_event(event, &cb_clone);
+                            dispatch_event(event, &cb_clone, &node_events).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -212,7 +213,18 @@ pub unsafe extern "C" fn linksy_node_new(
     Box::into_raw(handle)
 }
 
-fn dispatch_event(event: Event, cbs: &Arc<Mutex<Callbacks>>) {
+fn forward_packet(guard: &Callbacks, dev_id: &str, pkt_type: &str, payload: serde_json::Value) {
+    if let Some((cb, udata)) = guard.packet_cb {
+        let dev_c = CString::new(dev_id).unwrap_or_default();
+        let type_c = CString::new(pkt_type).unwrap_or_default();
+        let payload_c = CString::new(payload.to_string()).unwrap_or_default();
+        unsafe {
+            cb(dev_c.as_ptr(), type_c.as_ptr(), payload_c.as_ptr(), udata);
+        }
+    }
+}
+
+async fn dispatch_event(event: Event, cbs: &Arc<Mutex<Callbacks>>, node: &Node) {
     let guard = cbs.lock().unwrap();
     match event {
         Event::DeviceFound { device, addrs } => {
@@ -332,6 +344,97 @@ fn dispatch_event(event: Event, cbs: &Arc<Mutex<Callbacks>>) {
                     cb(dev_c.as_ptr(), type_c.as_ptr(), payload_c.as_ptr(), udata);
                 }
             }
+        }
+        Event::MediaState { from, state } => {
+            let player_ids: Vec<String> = state.players.iter().map(|p| p.id.clone()).collect();
+            let dev = from.id.to_string();
+            let list_payload = serde_json::json!({ "playerList": player_ids });
+            forward_packet(&guard, &dev, "kdeconnect.mpris", list_payload);
+            for player in &state.players {
+                let payload = serde_json::json!({
+                    "player": player.id,
+                    "playerList": player_ids,
+                    "title": player.title,
+                    "artist": player.artist,
+                    "album": player.album,
+                    "length": player.length_ms.unwrap_or(0),
+                    "pos": player.position_ms.unwrap_or(0),
+                    "playing": player.playing,
+                    "paused": !player.playing,
+                    "albumArtUrl": player.art.clone().unwrap_or_default(),
+                });
+                forward_packet(&guard, &dev, "kdeconnect.mpris", payload);
+            }
+        }
+        Event::MediaCommand { from, player, command } => {
+            let dev = from.id.to_string();
+            match command {
+                MediaCommand::Seek { position_ms } => {
+                    forward_packet(&guard, &dev, "kdeconnect.mpris.request",
+                        serde_json::json!({ "player": &player, "SetPosition": position_ms }));
+                }
+                MediaCommand::Play => {
+                    forward_packet(&guard, &dev, "kdeconnect.mpris.request",
+                        serde_json::json!({ "player": &player, "action": "play" }));
+                }
+                MediaCommand::Pause => {
+                    forward_packet(&guard, &dev, "kdeconnect.mpris.request",
+                        serde_json::json!({ "player": &player, "action": "pause" }));
+                }
+                MediaCommand::PlayPause => {
+                    forward_packet(&guard, &dev, "kdeconnect.mpris.request",
+                        serde_json::json!({ "player": &player, "action": "toggle" }));
+                }
+                MediaCommand::Next => {
+                    forward_packet(&guard, &dev, "kdeconnect.mpris.request",
+                        serde_json::json!({ "player": &player, "action": "next" }));
+                }
+                MediaCommand::Previous => {
+                    forward_packet(&guard, &dev, "kdeconnect.mpris.request",
+                        serde_json::json!({ "player": &player, "action": "previous" }));
+                }
+            }
+        }
+        Event::RunCommandRequested { from, key } => {
+            forward_packet(&guard, &from.id.to_string(), "kdeconnect.runcommand.request",
+                serde_json::json!({ "key": &key }));
+        }
+        Event::CommandsReceived { from, list } => {
+            let command_list: Vec<serde_json::Value> = list.iter().map(|c| {
+                serde_json::json!({ "id": &c.key, "name": &c.name, "command": &c.command })
+            }).collect();
+            forward_packet(&guard, &from.id.to_string(), "kdeconnect.runcommand",
+                serde_json::json!({ "commandList": command_list, "canAddCommand": false }));
+        }
+        Event::RequestCommandsReceived { from } => {
+            // The daemon already sends commands via QUIC. Also forward to C++
+            // so KDE Connect remotecommands plugin can respond via its own path.
+            forward_packet(&guard, &from.id.to_string(), "kdeconnect.runcommand.request",
+                serde_json::json!({ "requestCommandList": true }));
+        }
+        Event::OpenUrl { from, url } => {
+            forward_packet(&guard, &from.id.to_string(), "kdeconnect.openurl",
+                serde_json::json!({ "url": &url, "ask": true }));
+        }
+        Event::Ring { from, on } => {
+            forward_packet(&guard, &from.id.to_string(), "kdeconnect.findthisdevice",
+                serde_json::json!({ "request": on }));
+        }
+        Event::NotificationPosted { from, notification } => {
+            forward_packet(&guard, &from.id.to_string(), "kdeconnect.notification",
+                serde_json::json!({
+                    "key": &notification.key,
+                    "title": &notification.title,
+                    "text": &notification.body,
+                    "app": &notification.app,
+                    "time": 0i64,
+                    "canReply": notification.can_reply,
+                    "canRemove": true
+                }));
+        }
+        Event::NotificationRemoved { from, key } => {
+            forward_packet(&guard, &from.id.to_string(), "kdeconnect.notification",
+                serde_json::json!({ "key": &key, "deleted": true }));
         }
         _ => {}
     }

@@ -320,6 +320,16 @@ void LinksyLinkProvider::handlePacketReceived(const QString &deviceId, const QSt
     } else if (type == QLatin1String("ping")) {
         NetworkPacket np(QStringLiteral("kdeconnect.ping"));
         link->injectPacket(np);
+    } else {
+        // Generic fallback: forward all other packet types (kdeconnect.mpris,
+        // kdeconnect.runcommand, etc.) by constructing a NetworkPacket from
+        // the type string and parsed JSON body.
+        if (type.startsWith(QLatin1String("kdeconnect."))) {
+            NetworkPacket np(type, obj.toVariantMap());
+            link->injectPacket(np);
+        } else {
+            qCDebug(KDECONNECT_CORE) << "Unhandled Linksy packet type:" << type;
+        }
     }
 }
 

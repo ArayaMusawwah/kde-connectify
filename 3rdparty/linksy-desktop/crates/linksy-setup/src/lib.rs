@@ -1,0 +1,1044 @@
+//! Finish Setup's checks, shared by the GTK and the Qt app: the system pieces some features
+//! need and a distribution may not have (the webcam in every app, video, screen sharing,
+//! the clipboard, an open firewall, starting with the computer), and what's missing.
+//! Everything that needs root, installing packages included, is done by
+//! `linksy-system-setup` with pkexec, in one go: the computer asks for the password once,
+//! on any desktop, with the distribution's own package tool (dnf, apt, zypper, pacman). The
+//! same command is shown to run in a terminal instead.
+
+use std::path::{Path, PathBuf};
+
+use gio::prelude::*;
+use linksy_i18n::t;
+pub use linksy_host::pkexec::Prompt;
+
+/// Which window asks: they show video with different GStreamer sinks.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Ui {
+    Gtk,
+    Qt,
+}
+
+/// One thing to check.
+#[derive(Clone)]
+pub struct Item {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub why: &'static str,
+    pub need: Need,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Need {
+    Ready,
+    /// Distribution packages that bring it (then, for the camera, the device is made).
+    Install(Vec<String>),
+    /// Installed, but the camera device still has to be made (as root).
+    SetUp,
+    /// Nothing Linksy can do from here; what to do instead.
+    Manual(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Family {
+    Fedora,
+    Debian,
+    Arch,
+    /// openSUSE (Tumbleweed, Leap) and SUSE Linux Enterprise.
+    Suse,
+    Other,
+}
+
+fn family() -> Family {
+    // Inside a Flatpak, the host's release file is under /run/host.
+    let text = std::fs::read_to_string("/run/host/os-release").or_else(|_| std::fs::read_to_string("/etc/os-release")).unwrap_or_default();
+    family_of(&text, in_path)
+}
+
+/// From os-release, else from the package tool, as linksy-system-setup picks it: Artix
+/// doesn't say it's Arch (desktop#54).
+fn family_of(os_release: &str, has: impl Fn(&str) -> bool) -> Family {
+    let ids: Vec<&str> = os_release
+        .lines()
+        .filter_map(|l| l.strip_prefix("ID=").or_else(|| l.strip_prefix("ID_LIKE=")))
+        .flat_map(|v| v.trim_matches('"').split_whitespace())
+        .collect();
+    if ids.iter().any(|i| matches!(*i, "fedora" | "rhel" | "centos")) {
+        Family::Fedora
+    } else if ids.iter().any(|i| matches!(*i, "debian" | "ubuntu")) {
+        Family::Debian
+    } else if ids.iter().any(|i| matches!(*i, "arch" | "artix")) {
+        Family::Arch
+    } else if ids.iter().any(|i| i.starts_with("opensuse") || matches!(*i, "suse" | "sles")) {
+        Family::Suse
+    } else if has("dnf") {
+        Family::Fedora
+    } else if has("apt-get") {
+        Family::Debian
+    } else if has("zypper") {
+        Family::Suse
+    } else if has("pacman") {
+        Family::Arch
+    } else {
+        Family::Other
+    }
+}
+
+pub fn flatpak() -> bool {
+    linksy_host::flatpak()
+}
+
+/// Fedora Atomic (Silverblue, Kinoite): packages are layered with rpm-ostree, then a restart.
+pub fn atomic() -> bool {
+    static ATOMIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ATOMIC.get_or_init(|| linksy_host::exists(Path::new("/run/ostree-booted")))
+}
+
+/// openSUSE's transactional systems (Aeon, Kalpa, MicroOS): a read-only root, so packages
+/// go in with transactional-update, then a restart. zypper would fail there.
+pub fn transactional() -> bool {
+    static TRANSACTIONAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRANSACTIONAL.get_or_init(transactional_now)
+}
+
+fn transactional_now() -> bool {
+    let read_only_root = linksy_host::read(Path::new("/proc/mounts")).is_some_and(|m| {
+        m.lines().any(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            f.get(1) == Some(&"/") && f.get(3).is_some_and(|o| o.split(',').any(|o| o == "ro"))
+        })
+    });
+    read_only_root && linksy_host::exists(Path::new("/usr/sbin/transactional-update"))
+}
+
+/// The running kernel's version (`uname -r`).
+fn kernel() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_string()
+}
+
+/// The headers package for the running kernel on Arch and its derivatives: each kernel
+/// package notes its own name (`pkgbase`: linux, linux-lts, linux-cachyos…), its headers
+/// being that name with "-headers".
+fn arch_headers(k: &str) -> String {
+    let pkgbase = linksy_host::read(&PathBuf::from(format!("/usr/lib/modules/{k}/pkgbase"))).map(|s| s.trim().to_string()).filter(|s| s.starts_with("linux"));
+    let pkgbase = pkgbase.unwrap_or_else(|| ["lts", "zen", "hardened"].iter().find(|f| k.ends_with(*f)).map_or("linux".to_string(), |f| format!("linux-{f}")));
+    format!("{pkgbase}-headers")
+}
+
+/// The camera driver's packages; a driver built here (DKMS) needs the kernel's headers.
+/// openSUSE ships it prebuilt and signed per kernel flavor (the end of `uname -r`: default,
+/// longterm), so no building and no Secure Boot step there.
+fn loopback_packages(fam: Family) -> Vec<String> {
+    let k = kernel();
+    match fam {
+        Family::Fedora => vec!["akmod-v4l2loopback".into(), "v4l2loopback".into()],
+        Family::Suse => {
+            let flavor = k.rsplit('-').next().filter(|f| !f.is_empty()).unwrap_or("default");
+            vec![format!("v4l2loopback-kmp-{flavor}"), "v4l2loopback-utils".into()]
+        }
+        Family::Debian => vec!["v4l2loopback-dkms".into(), "v4l2loopback-utils".into(), format!("linux-headers-{k}")],
+        Family::Arch => vec!["v4l2loopback-dkms".into(), "v4l2loopback-utils".into(), arch_headers(&k)],
+        Family::Other => Vec::new(),
+    }
+}
+
+/// The package with `v4l2loopback-ctl`, for when the driver comes with the kernel
+/// (CachyOS) but the tool to add a device doesn't.
+fn loopback_tool(fam: Family) -> Option<&'static str> {
+    match fam {
+        Family::Fedora => Some("v4l2loopback"),
+        Family::Debian | Family::Arch | Family::Suse => Some("v4l2loopback-utils"),
+        Family::Other => None,
+    }
+}
+
+fn has_element(names: &[&str]) -> bool {
+    if gstreamer::init().is_err() {
+        return false;
+    }
+    names.iter().any(|n| gstreamer::ElementFactory::find(n).is_some())
+}
+
+/// Whether apt knows a package (an installable version).
+fn apt_has(package: &str) -> bool {
+    linksy_host::command("apt-cache", &[])
+        .args(["policy", package])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim().strip_prefix("Candidate:").is_some_and(|c| c.trim() != "(none)")))
+}
+
+fn in_path(cmd: &str) -> bool {
+    // pkexec runs the helper with the system's PATH: sbin included, as here.
+    if flatpak() {
+        return linksy_host::installed(cmd) || ["/usr/sbin", "/sbin"].iter().any(|d| linksy_host::exists(&Path::new(d).join(cmd)));
+    }
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).chain(["/usr/sbin".into(), "/sbin".into()]).any(|d| d.join(cmd).is_file()))
+}
+
+/// The "Linksy Camera" video device, if it exists.
+pub fn camera_device() -> Option<PathBuf> {
+    std::fs::read_dir("/sys/class/video4linux").ok()?.flatten().find_map(|e| {
+        let name = std::fs::read_to_string(e.path().join("name")).ok()?;
+        (name.trim() == "Linksy Camera").then(|| PathBuf::from("/dev").join(e.file_name()))
+    })
+}
+
+/// What apps call a phone's camera: one "Linksy Camera" device for all phones when it
+/// exists, else a PipeWire camera named after the phone.
+pub fn camera_name(phone: &str) -> String {
+    if camera_device().is_some() { "Linksy Camera".into() } else { format!("Linksy Camera ({phone})") }
+}
+
+/// An X11 session (no Wayland display), where Linksy reads the screen without a portal.
+fn x11() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_some()
+}
+
+/// Whether the desktop offers screen sharing to apps (the ScreenCast portal).
+fn screencast_portal() -> bool {
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else { return true };
+    bus.call_sync(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        Some(&("org.freedesktop.portal.ScreenCast", "version").to_variant()),
+        None,
+        gio::DBusCallFlags::NONE,
+        2000,
+        gio::Cancellable::NONE,
+    )
+    .is_ok()
+}
+
+/// The portal backend that does screen sharing on this desktop.
+fn portal_package() -> &'static str {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    if desktop.contains("kde") {
+        "xdg-desktop-portal-kde"
+    } else if desktop.contains("hyprland") {
+        "xdg-desktop-portal-hyprland"
+    } else if desktop.contains("niri") {
+        // niri shares screens through GNOME's portal
+        "xdg-desktop-portal-gnome"
+    } else if ["sway", "river", "wlroots", "wayfire", "labwc"].iter().any(|d| desktop.contains(d)) {
+        "xdg-desktop-portal-wlr"
+    } else {
+        "xdg-desktop-portal-gnome"
+    }
+}
+
+fn output(argv: &[&str]) -> Option<String> {
+    let out = linksy_host::command(argv[0], &[]).args(&argv[1..]).stderr(std::process::Stdio::null()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether polkit lets this process do `action` right now without asking for a password.
+/// Anything but a clear no (polkit missing, D-Bus down) counts as yes: the call then
+/// decides for itself, as before.
+fn polkit_allows(action: &str) -> bool {
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) else { return true };
+    // The subject is this process: its pid, start time (field 22 of /proc/self/stat, after
+    // the command's closing parenthesis) and uid, so polkit needn't look them up.
+    let start_time = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| s.rsplit_once(") ")?.1.split_whitespace().nth(19)?.parse::<u64>().ok()).unwrap_or(0);
+    let uid = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace().next()?.parse::<i32>().ok()).unwrap_or(-1);
+    let subject: std::collections::HashMap<&str, gio::glib::Variant> = [("pid", std::process::id().to_variant()), ("start-time", start_time.to_variant()), ("uid", uid.to_variant())].into();
+    let details: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    // Flags 0: never ask the user from here.
+    let args = (("unix-process", subject), action, details, 0u32, "").to_variant();
+    let Ok(reply) = bus.call_sync(
+        Some("org.freedesktop.PolicyKit1"),
+        "/org/freedesktop/PolicyKit1/Authority",
+        "org.freedesktop.PolicyKit1.Authority",
+        "CheckAuthorization",
+        Some(&args),
+        None,
+        gio::DBusCallFlags::NONE,
+        2000,
+        gio::Cancellable::NONE,
+    ) else {
+        return true;
+    };
+    // (is_authorized, is_challenge, details)
+    reply.child_value(0).child_value(0).get::<bool>().unwrap_or(true)
+}
+
+/// Whether a firewall would keep nearby devices out: None when there's none to open.
+fn firewall_need() -> Option<Need> {
+    if linksy_host::exists(Path::new("/etc/linksy/firewall")) {
+        return Some(Need::Ready);
+    }
+    // Whether firewalld runs, from systemd: `firewall-cmd --state` asks firewalld, and on
+    // openSUSE even that needs the administrator's password (its state property falls
+    // under firewalld's config action).
+    let firewalld = output(&["systemctl", "is-active", "--quiet", "firewalld.service"]).is_some();
+    if in_path("firewall-cmd") && firewalld {
+        // Reading the zone (firewalld's config.info action) needs no password on Fedora or
+        // Debian; on openSUSE it needs the administrator's, at every start. Then nothing
+        // is read: the firewall counts as closed until Linksy opens it itself (the marker
+        // above), one password, when asked to. Anything unclear gets opened.
+        if !polkit_allows("org.fedoraproject.FirewallD1.config.info") {
+            return Some(Need::SetUp);
+        }
+        let Some(zone) = output(&["firewall-cmd", "--list-all"]) else { return Some(Need::SetUp) };
+        let field = |name: &str| zone.lines().find_map(|l| l.trim().strip_prefix(&format!("{name}:")).map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())).unwrap_or_default();
+        let (services, ports) = (field("services"), field("ports"));
+        let open = |port: u32| {
+            ports.iter().any(|p| {
+                let Some((range, "udp")) = p.split_once('/') else { return false };
+                let (lo, hi) = range.split_once('-').unwrap_or((range, range));
+                lo.parse::<u32>().is_ok_and(|lo| hi.parse::<u32>().is_ok_and(|hi| (lo..=hi).contains(&port)))
+            })
+        };
+        let ready = services.iter().any(|s| s == "linksy") || (open(47200) && (open(5353) || services.iter().any(|s| s == "mdns")));
+        return Some(if ready { Need::Ready } else { Need::SetUp });
+    }
+    let ufw = linksy_host::read(Path::new("/etc/ufw/ufw.conf")).unwrap_or_default();
+    if ufw.lines().any(|l| l.trim() == "ENABLED=yes") {
+        return Some(Need::SetUp);
+    }
+    None
+}
+
+/// Whether the background service starts with every login: None when it isn't installed
+/// as a user service (run from the source tree).
+fn autostart_need() -> Option<Need> {
+    // The Flatpak's service starts from an XDG autostart entry of its own
+    if flatpak() {
+        return Some(if linksy_host::exists(&flatpak_autostart()) { Need::Ready } else { Need::SetUp });
+    }
+    let state = match std::process::Command::new("systemctl").args(["--user", "is-enabled", "linksyd.service"]).stderr(std::process::Stdio::null()).output() {
+        Ok(s) if !s.stdout.is_empty() => s,
+        // No systemd, or no user manager (Artix, Void: desktop#11): desktops start the service
+        // from its XDG autostart entry, tiling compositors from a line in their config
+        _ => return compositor_autostart().map(Need::Manual),
+    };
+    match String::from_utf8_lossy(&state.stdout).trim() {
+        // Enabled, but tiling compositors seldom start systemd's graphical session, which
+        // starts it: then one line in their config does
+        s if enabled(s) && !graphical_session() => compositor_autostart().map(Need::Manual).or(Some(Need::Ready)),
+        s if enabled(s) => Some(Need::Ready),
+        "disabled" => Some(Need::SetUp),
+        _ => None,
+    }
+}
+
+fn enabled(state: &str) -> bool {
+    matches!(state, "enabled" | "enabled-runtime" | "static" | "linked" | "alias")
+}
+
+/// linksyd.service's state, from `systemctl --user is-enabled`: None without a user manager
+/// or without the service.
+fn unit_state() -> Option<String> {
+    let out = std::process::Command::new("systemctl").args(["--user", "is-enabled", "linksyd.service"]).stderr(std::process::Stdio::null()).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty() && s != "not-found")
+}
+
+fn systemctl(args: &[&str]) -> bool {
+    std::process::Command::new("systemctl").arg("--user").args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+/// The user's own link in place of the one packages make for everyone (`systemctl --global
+/// enable`), which `systemctl --user disable` leaves: pointing to /dev/null, it masks it.
+fn wants_link() -> PathBuf {
+    linksy_host::config_dir().join("systemd/user/graphical-session.target.wants/linksyd.service")
+}
+
+fn masked(link: &Path) -> bool {
+    std::fs::read_link(link).is_ok_and(|t| t == Path::new("/dev/null"))
+}
+
+/// The XDG autostart entry, for desktops without systemd's graphical session: the user's
+/// own (the tarball's, or one hiding the system's).
+fn xdg_entry() -> PathBuf {
+    linksy_host::config_dir().join("autostart/linksyd.desktop")
+}
+
+/// Whether a package put the entry in the system's autostart folder.
+fn system_xdg_entry() -> bool {
+    let dirs = std::env::var("XDG_CONFIG_DIRS").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "/etc/xdg".into());
+    dirs.split(':').any(|d| Path::new(d).join("autostart/linksyd.desktop").is_file())
+}
+
+/// The user's entry that hides the system's.
+const XDG_HIDDEN: &str = "[Desktop Entry]\nType=Application\nName=Linksy service\nExec=linksyd\nHidden=true\n";
+
+fn hidden_line(line: &str) -> Option<bool> {
+    line.split_once('=').filter(|(k, _)| k.trim() == "Hidden").map(|(_, v)| v.trim() == "true")
+}
+
+fn with_hidden(entry: &str, hide: bool) -> String {
+    let mut out = String::new();
+    for line in entry.lines().filter(|l| hidden_line(l).is_none()) {
+        out.push_str(line);
+        out.push('\n');
+        if hide && line.trim() == "[Desktop Entry]" {
+            out.push_str("Hidden=true\n");
+        }
+    }
+    out
+}
+
+/// Whether the XDG entry at `path`, else the system's (`system`), starts the service: None
+/// when there's neither.
+fn xdg_shown(path: &Path, system: bool) -> Option<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(!text.lines().any(|l| hidden_line(l) == Some(true))),
+        Err(_) => system.then_some(true),
+    }
+}
+
+fn show_xdg_entry(path: &Path, system: bool, show: bool) -> std::io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if show && text == XDG_HIDDEN => std::fs::remove_file(path),
+        Ok(text) => {
+            let next = with_hidden(&text, !show);
+            if next == text { Ok(()) } else { std::fs::write(path, next) }
+        }
+        Err(_) if !show && system => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(path, XDG_HIDDEN)
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// Whether something shows notifications: a daemon running, or one D-Bus starts when asked.
+fn notification_daemon() -> bool {
+    const NAME: &str = "org.freedesktop.Notifications";
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else { return true };
+    let call = |method: &str, args: Option<&gio::glib::Variant>| {
+        bus.call_sync(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", "org.freedesktop.DBus", method, args, None, gio::DBusCallFlags::NONE, 2000, gio::Cancellable::NONE)
+    };
+    let owned = call("NameHasOwner", Some(&(NAME,).to_variant())).ok().and_then(|v| v.get::<(bool,)>()).is_none_or(|(b,)| b);
+    owned || call("ListActivatableNames", None).ok().and_then(|v| v.get::<(Vec<String>,)>()).is_some_and(|(names,)| names.iter().any(|n| n == NAME))
+}
+
+/// An AMD graphics card or chip (PCI vendor 0x1002).
+fn amd_gpu() -> bool {
+    std::fs::read_dir("/sys/class/drm").is_ok_and(|d| {
+        d.flatten().any(|e| std::fs::read_to_string(e.path().join("device/vendor")).is_ok_and(|v| v.trim() == "0x1002"))
+    })
+}
+
+fn graphical_session() -> bool {
+    std::process::Command::new("systemctl").args(["--user", "is-active", "--quiet", "graphical-session.target"]).status().is_ok_and(|s| s.success())
+}
+
+/// The line that starts Linksy with a tiling compositor, for its config file.
+fn compositor_autostart() -> Option<&'static str> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    if desktop.contains("hyprland") {
+        Some(t!("Hyprland doesn't start Linksy at login by itself. Add this line to ~/.config/hypr/hyprland.conf: exec-once = linksyd"))
+    } else if desktop.contains("sway") {
+        Some(t!("Sway doesn't start Linksy at login by itself. Add this line to ~/.config/sway/config: exec linksyd"))
+    } else if desktop.contains("niri") {
+        Some(t!("niri doesn't start Linksy at login by itself. Add this line to ~/.config/niri/config.kdl: spawn-at-startup \"linksyd\""))
+    } else if desktop.contains("river") {
+        Some(t!("river doesn't start Linksy at login by itself. Add this line to ~/.config/river/init: linksyd &"))
+    } else {
+        None
+    }
+}
+
+fn loopback_installed() -> bool {
+    linksy_host::exists(Path::new("/sys/module/v4l2loopback")) || output(&["modinfo", "v4l2loopback"]).is_some()
+}
+
+/// Linksy's udev rule, as of version 2 (phones in charging-only mode too).
+fn usb_rule() -> bool {
+    ["/usr/lib/udev/rules.d/70-linksy-usb.rules", "/etc/udev/rules.d/70-linksy-usb.rules"]
+        .iter()
+        .any(|p| linksy_host::read(Path::new(p)).is_some_and(|rule| rule.contains("Rule version 2")))
+}
+
+/// The Flatpak's autostart entry, in the computer's own config folder.
+fn flatpak_autostart() -> PathBuf {
+    linksy_host::config_dir().join("autostart/mg.diary.linksy.Linksy.service.desktop")
+}
+
+/// Whether the Flatpak starts the service from the entry of its own (Finish Setup writes it).
+pub fn own_autostart() -> bool {
+    linksy_host::exists(&flatpak_autostart())
+}
+
+/// The one the Background portal writes when the window asks it to start the service.
+fn portal_autostart() -> PathBuf {
+    linksy_host::config_dir().join("autostart/mg.diary.linksy.Linksy.desktop")
+}
+
+fn stop_portal_autostart() {
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else { return };
+    let options = gio::glib::VariantDict::new(None);
+    options.insert("reason", t!("Linksy stays ready for your devices when its window is closed."));
+    options.insert("autostart", false);
+    let _ = bus.call_sync(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Background",
+        "RequestBackground",
+        Some(&gio::glib::Variant::tuple_from_iter(["".to_variant(), options.end()])),
+        None,
+        gio::DBusCallFlags::NONE,
+        5000,
+        gio::Cancellable::NONE,
+    );
+}
+
+/// What this computer has and lacks, right now, for the `ui` window.
+pub fn check(ui: Ui) -> Vec<Item> {
+    let fam = family();
+    let pick = |fedora: &[&str], debian: &[&str], arch: &[&str], suse: &[&str], manual: &'static str| {
+        let names = match fam {
+            Family::Fedora => fedora,
+            Family::Debian => debian,
+            Family::Arch => arch,
+            Family::Suse => suse,
+            Family::Other => return Need::Manual(manual),
+        };
+        Need::Install(names.iter().map(|n| n.to_string()).collect())
+    };
+    let camera = if camera_device().is_some() {
+        Need::Ready
+    } else if loopback_installed() {
+        // Some kernels bring the driver without its tool (CachyOS): add the tool first.
+        match loopback_tool(fam) {
+            Some(tool) if !in_path("v4l2loopback-ctl") => Need::Install(vec![tool.to_string()]),
+            None if !in_path("v4l2loopback-ctl") => Need::Manual(t!("Install v4l2loopback from your distribution, then come back here.")),
+            _ => Need::SetUp,
+        }
+    } else if fam == Family::Other {
+        Need::Manual(t!("Install v4l2loopback from your distribution, then come back here."))
+    } else {
+        Need::Install(loopback_packages(fam))
+    };
+    let mut items = vec![Item {
+        id: "camera",
+        title: t!("Phone Camera in Every App"),
+        why: t!("Browsers, Zoom and Discord only see this kind of camera. Without it, the phone's camera works in OBS and PipeWire apps only."),
+        need: camera,
+    }];
+    items.push(Item {
+        id: "usb",
+        title: t!("Phones by USB Cable"),
+        why: t!("Plug a phone in for a faster webcam and microphone, with no Wi-Fi needed."),
+        need: if usb_rule() { Need::Ready } else { Need::SetUp },
+    });
+    // In a Flatpak, codecs and tools come with the runtime and the app.
+    if !flatpak() {
+        // H.264 both ways, and the window's video sink to show it: GTK's (on openSUSE, in
+        // the gstreamer-plugins-rs bundle) or Qt Quick's.
+        let (mut fedora, mut debian, mut arch, mut suse) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        if !(has_element(&["avdec_h264", "vah264dec", "openh264dec"]) && has_element(&["vah264lpenc", "vah264enc", "x264enc", "openh264enc"])) {
+            fedora.extend(["gstreamer1-plugin-openh264", "gstreamer1-plugin-libav"]);
+            debian.extend(["gstreamer1.0-libav", "gstreamer1.0-plugins-ugly"]);
+            arch.extend(["gst-libav", "gst-plugins-ugly"]);
+            suse.extend(["gstreamer-plugin-openh264", "gstreamer-plugins-libav"]);
+        }
+        match ui {
+            // Ubuntu 24.04 has no package for it: the app draws frames itself there
+            Ui::Gtk if !has_element(&["gtk4paintablesink"]) && !(family() == Family::Debian && !apt_has("gstreamer1.0-gtk4")) => {
+                fedora.push("gstreamer1-plugin-gtk4");
+                debian.push("gstreamer1.0-gtk4");
+                arch.push("gst-plugin-gtk4");
+                suse.push("gstreamer-plugins-rs");
+            }
+            Ui::Qt if !has_element(&["qml6glsink"]) => {
+                fedora.push("gstreamer1-plugins-good-qt6");
+                debian.push("gstreamer1.0-qt6");
+                arch.push("gst-plugin-qml6");
+                suse.push("gstreamer-plugins-good-qtqml6");
+            }
+            _ => {}
+        }
+        let manual = match ui {
+            Ui::Gtk => t!("Install GStreamer's H.264 plugins (openh264 or libav) and its GTK 4 video sink (gtk4paintablesink) from your distribution."),
+            Ui::Qt => t!("Install GStreamer's H.264 plugins (openh264 or libav) and its Qt 6 video sink (qml6glsink) from your distribution."),
+        };
+        items.push(Item {
+            id: "video",
+            title: t!("Video for Screens and Cameras"),
+            why: t!("To send and show screens, second displays and the phone's camera."),
+            need: if fedora.is_empty() { Need::Ready } else { pick(&fedora, &debian, &arch, &suse, manual) },
+        });
+        let (mut fedora, mut debian, mut arch, mut suse) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        if !has_element(&["pipewiresrc"]) {
+            fedora.push("pipewire-gstreamer");
+            debian.push("gstreamer1.0-pipewire");
+            arch.push("gst-plugin-pipewire");
+            suse.push("gstreamer-plugin-pipewire");
+        }
+        if x11() {
+            // No portal works on X11: Linksy reads the display itself (#67)
+            if !has_element(&["ximagesrc"]) {
+                fedora.push("gstreamer1-plugins-good");
+                debian.push("gstreamer1.0-plugins-good");
+                arch.push("gst-plugins-good");
+                suse.push("gstreamer-plugins-good");
+            }
+        } else if !screencast_portal() {
+            for list in [&mut fedora, &mut debian, &mut arch, &mut suse] {
+                list.push(portal_package());
+            }
+        }
+        items.push(Item {
+            id: "pipewire",
+            title: t!("Screen Sharing"),
+            why: t!("Reading this computer's screen, and offering the phone's camera to apps."),
+            need: if fedora.is_empty() { Need::Ready } else { pick(&fedora, &debian, &arch, &suse, t!("Install PipeWire's GStreamer plugin and your desktop's screen sharing portal.")) },
+        });
+        // Fedora's AMD video driver leaves H.264 encoding out (patents): RPM Fusion's full one
+        // lets the GPU encode a second display at up to 60 fps, instead of the CPU at 30
+        if fam == Family::Fedora && amd_gpu() && !has_element(&["vah264enc", "vah264lpenc"]) {
+            items.push(Item {
+                id: "gpu-video",
+                title: t!("Smoother Second Display"),
+                why: t!("Your graphics can encode video, but Fedora's driver leaves that out. RPM Fusion's full driver lets it send screens at up to 60 frames a second, with almost no processor."),
+                need: Need::Install(vec!["mesa-va-drivers-freeworld".to_string()]),
+            });
+        }
+        let clip = in_path("wl-copy") || in_path("xclip") || in_path("xsel");
+        items.push(Item {
+            id: "clipboard",
+            title: t!("Clipboard From Your Phone"),
+            why: t!("Putting text your phone shares on this computer's clipboard while Linksy's window is closed."),
+            need: if clip { Need::Ready } else { pick(&["wl-clipboard"], &["wl-clipboard"], &["wl-clipboard"], &["wl-clipboard"], t!("Install wl-clipboard.")) },
+        });
+        // Tiling compositors start none; mako starts by itself once installed (D-Bus activation)
+        if !notification_daemon() {
+            items.push(Item {
+                id: "notifications",
+                title: t!("Notifications"),
+                why: t!("Files, pairing codes and requests from your devices show as notifications, with their buttons."),
+                need: pick(&["mako"], &["mako-notifier"], &["mako"], &["mako"], t!("Install a notification daemon (mako, dunst or swaync) and start it with your desktop.")),
+            });
+        }
+    }
+    if let Some(need) = firewall_need() {
+        items.push(Item {
+            id: "firewall",
+            title: t!("Found by Nearby Devices"),
+            why: t!("The firewall lets your devices reach Linksy here (UDP 47200, and mDNS to find each other)."),
+            need,
+        });
+    }
+    if !autostart_off()
+        && let Some(need) = autostart_need()
+    {
+        items.push(Item {
+            id: "autostart",
+            title: t!("Ready When You Log In"),
+            why: t!("Linksy starts in the background with your computer, so phones can reach it with the window closed."),
+            need,
+        });
+    }
+    items
+}
+
+/// What "Set Up Everything" can do from here (not the things to do by hand). On Fedora
+/// Atomic and openSUSE's transactional systems, packages are for a terminal.
+pub fn actionable(items: &[Item]) -> Vec<Item> {
+    let layered = atomic() || transactional();
+    items.iter().filter(|i| matches!(i.need, Need::SetUp) || (matches!(i.need, Need::Install(_)) && !layered)).cloned().collect()
+}
+
+/// How many things are missing (what the sidebar's Finish Setup shows).
+pub fn missing(items: &[Item]) -> usize {
+    items.iter().filter(|i| i.need != Need::Ready).count()
+}
+
+/// What a row tells about an item installed by hand on Fedora Atomic or openSUSE's
+/// transactional systems; None elsewhere.
+pub fn layered_hint(why: &str) -> Option<String> {
+    if atomic() {
+        Some(t!("{why} On Fedora Atomic: the command at the bottom, then restart.", why))
+    } else if transactional() {
+        Some(t!("{why} On openSUSE Aeon, Kalpa or MicroOS: the command at the bottom, then restart.", why))
+    } else {
+        None
+    }
+}
+
+/// The root helper (`linksy-system-setup`): installed next to Linksy, or with the package
+/// (in /usr/libexec, or /usr/lib on Arch), or in the Flatpak, or in the source tree when run
+/// from it.
+fn setup_script(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [dir.join(name), PathBuf::from("/usr/libexec/linksy").join(name), PathBuf::from("/usr/lib/linksy").join(name), PathBuf::from("/app/libexec/linksy").join(name), dir.join("../../data").join(name)]
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// What `linksy-system-setup` gets to set up `items` as root, in one run: RPM Fusion when
+/// Fedora's camera driver needs it, the packages, then the camera, USB and firewall.
+pub fn root_args(items: &[Item]) -> Vec<String> {
+    let packages: Vec<String> = items.iter().flat_map(|i| if let Need::Install(p) = &i.need { p.clone() } else { Vec::new() }).collect();
+    let mut args = Vec::new();
+    let from_fusion = |p: &String| p.contains("v4l2loopback") || p.ends_with("-freeworld");
+    if family() == Family::Fedora && packages.iter().any(from_fusion) && !linksy_host::exists(Path::new("/etc/yum.repos.d/rpmfusion-free.repo")) {
+        args.push("rpmfusion".to_string());
+    }
+    args.extend(packages.iter().map(|p| format!("pkg:{p}")));
+    args.extend(items.iter().filter(|i| matches!(i.id, "camera" | "usb" | "firewall")).map(|i| i.id.to_string()));
+    args
+}
+
+/// Whether setting up `items` turns on starting with the computer (the user's own
+/// service: no password).
+pub fn wants_autostart(items: &[Item]) -> bool {
+    items.iter().any(|i| i.id == "autostart" && i.need != Need::Ready)
+}
+
+/// The same as Set Up Everything, to run in a terminal: for whoever prefers to, or when
+/// the password dialog can't appear.
+pub fn terminal_command(items: &[Item]) -> Option<String> {
+    if atomic() || transactional() {
+        let packages: Vec<String> = items.iter().flat_map(|i| if let Need::Install(p) = &i.need { p.clone() } else { Vec::new() }).collect();
+        let tool = if atomic() { "rpm-ostree install" } else { "transactional-update --non-interactive pkg install" };
+        return (!packages.is_empty()).then(|| format!("sudo {tool} {} && systemctl reboot", packages.join(" ")));
+    }
+    let args = root_args(&actionable(items));
+    // In the Flatpak: the helper where the computer sees it
+    let script = linksy_host::path(&setup_script("linksy-system-setup")?);
+    let mut command = if args.is_empty() { String::new() } else { format!("sudo {} {}", script.display(), args.join(" ")) };
+    if wants_autostart(items) && !flatpak() {
+        command = [command, "systemctl --user enable --now linksyd.service".into()].iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(" && ");
+    }
+    (!command.is_empty()).then_some(command)
+}
+
+/// Why setting up stopped.
+pub enum Failure {
+    Message(String),
+    /// The camera driver waits for Secure Boot's approval at the next restart; with the
+    /// code to type in the blue screen then, when there is one.
+    Restart(Option<String>),
+}
+
+/// The helper's step (it speaks English) in the language in use.
+pub fn step_text(step: &str) -> String {
+    match step.trim() {
+        "Turning on RPM Fusion" => t!("Turning on RPM Fusion").into(),
+        "Building the camera driver (a few minutes)" => t!("Building the camera driver (a few minutes)").into(),
+        "Letting nearby devices find this computer" => t!("Letting nearby devices find this computer").into(),
+        "Making the Linksy Camera" => t!("Making the Linksy Camera").into(),
+        "Building the camera driver again, signed with the approved key" => t!("Building the camera driver again, signed with the approved key").into(),
+        "Letting Linksy use phones plugged in by cable" => t!("Letting Linksy use phones plugged in by cable").into(),
+        s => match s.strip_prefix("Installing ") {
+            Some(packages) => t!("Installing {packages}", packages),
+            None => s.to_string(),
+        },
+    }
+}
+
+/// Reads the helper's output as it comes: steps to show, the Secure Boot code, and the last
+/// lines for when it fails.
+#[derive(Default)]
+pub struct Progress {
+    enroll: Option<String>,
+    last: std::collections::VecDeque<String>,
+    /// pkexec had nobody to ask for the password, not even on its terminal.
+    no_agent: bool,
+    timed_out: bool,
+    wrong: bool,
+}
+
+impl Progress {
+    /// One line of output; the step to show now, if it is one.
+    pub fn line(&mut self, line: &str) -> Option<String> {
+        if let Some(step) = line.strip_prefix("STEP ") {
+            return Some(t!("{step}…", step = step_text(step)));
+        }
+        if line.contains("No authentication agent found") || line.contains("Error creating textual authentication agent") {
+            self.no_agent = true;
+        }
+        if let Some(code) = line.strip_prefix("ENROLL ") {
+            self.enroll = Some(code.trim().to_string());
+        } else if !line.trim().is_empty() {
+            self.last.push_back(line.trim().to_string());
+            if self.last.len() > 3 {
+                self.last.pop_front();
+            }
+        }
+        None
+    }
+
+    /// What the helper's exit status means.
+    pub fn finish(self, status: i32) -> Result<(), Failure> {
+        match status {
+            0 => Ok(()),
+            _ if self.timed_out => Err(Failure::Message(t!("Linksy stopped waiting for the password after two minutes. If no password window came up, run the command under Prefer a Terminal? instead.").into())),
+            _ if self.wrong => Err(Failure::Message(t!("Not set up: the password didn't work.").into())),
+            _ if self.no_agent => Err(no_agent()),
+            4 => Err(Failure::Restart(self.enroll)),
+            126 | 127 => Err(Failure::Message(t!("Not set up: the password wasn't given.").into())),
+            _ => Err(Failure::Message(t!("Setup didn't finish: {details}", details = self.last.into_iter().collect::<Vec<_>>().join(" ")))),
+        }
+    }
+}
+
+/// pkexec and the helper, with `args`: the command line to run (as root, one password).
+pub fn root_command(args: &[String]) -> Result<Vec<std::ffi::OsString>, Failure> {
+    let pkexec = linksy_host::command("pkexec", &[]);
+    let mut argv: Vec<std::ffi::OsString> = std::iter::once(pkexec.get_program()).chain(pkexec.get_args()).map(|a| a.to_os_string()).collect();
+    argv.extend(helper(args)?);
+    Ok(argv)
+}
+
+/// The helper with `args`, where the computer sees it (the Flatpak's is under its install
+/// folder there).
+fn helper(args: &[String]) -> Result<Vec<std::ffi::OsString>, Failure> {
+    let script = setup_script("linksy-system-setup").ok_or_else(|| Failure::Message(t!("Linksy's setup helper is missing; reinstall Linksy.").into()))?;
+    Ok(std::iter::once(linksy_host::path(&script).into_os_string()).chain(args.iter().map(Into::into)).collect())
+}
+
+/// Run `linksy-system-setup` as root and wait, telling `step` what it does as it goes. Where
+/// no polkit agent runs, `ask` gets the password (Linksy's own prompt). For a thread of its
+/// own: it blocks until the helper ends.
+pub fn run_as_root(args: &[String], ask: impl FnMut(&Prompt) -> Option<String>, mut step: impl FnMut(String)) -> Result<(), Failure> {
+    let argv = helper(args)?;
+    let mut progress = Progress::default();
+    step(t!("Waiting for your password…").into());
+    let outcome = linksy_host::pkexec::run(&argv, ask, |line| {
+        if let Some(s) = progress.line(line) {
+            step(s);
+        }
+    })
+    .map_err(|e| Failure::Message(e.to_string()))?;
+    progress.timed_out = outcome.timed_out;
+    progress.wrong = outcome.wrong;
+    progress.finish(outcome.code)
+}
+
+/// Everything Linksy relies on, for installing it by hand (desktop#35).
+pub const BY_HAND: &str = "https://github.com/LinkSy-mg/linksy-desktop/blob/main/docs/dependencies.md";
+
+/// pkexec had nobody to ask for the password, not even on its terminal.
+fn no_agent() -> Failure {
+    Failure::Message(t!("This desktop has no password prompt running (a polkit agent, like hyprpolkitagent or polkit-gnome). Run the command under Prefer a Terminal? instead, or install and start one.").into())
+}
+
+/// Turn on the background service at every login (no password: it's the user's own).
+pub fn enable_autostart() -> Result<(), Failure> {
+    if flatpak() {
+        let entry = format!(
+            "[Desktop Entry]\nType=Application\nName=Linksy service\nComment=Keeps Linksy ready for your devices\nExec={}\nIcon=mg.diary.linksy.Linksy\nNoDisplay=true\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+            linksy_host::launcher("linksyd")
+        );
+        linksy_host::write(&flatpak_autostart(), entry.as_bytes()).map_err(|_| Failure::Message(t!("Couldn't turn on starting with your computer.").into()))?;
+        // One entry starts the service: the Background portal's, written when the window starts
+        // it, would start a second one at every login
+        stop_portal_autostart();
+        return Ok(());
+    }
+    let ok = std::process::Command::new("systemctl").args(["--user", "enable", "--now", "linksyd.service"]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+    if ok { Ok(()) } else { Err(Failure::Message(t!("Couldn't turn on starting with your computer.").into())) }
+}
+
+/// Whether the background service starts with every login, as Preferences shows it: None
+/// where Linksy can't change that (run from the source tree, or a line in a tiling
+/// compositor's config). For a thread of its own: it runs systemctl.
+pub fn autostart() -> Option<bool> {
+    if flatpak() {
+        return Some(linksy_host::exists(&flatpak_autostart()) || linksy_host::exists(&portal_autostart()));
+    }
+    let graphical = graphical_session();
+    if !graphical && compositor_autostart().is_some() {
+        return None;
+    }
+    match unit_state() {
+        Some(state) if graphical => Some(enabled(&state) && !masked(&wants_link())),
+        _ => xdg_shown(&xdg_entry(), system_xdg_entry()),
+    }
+}
+
+/// Start the background service with every login, or not; the service goes on running
+/// now either way. The choice is kept, so Finish Setup leaves it off. For a thread of its own.
+pub fn set_autostart(on: bool) -> Result<(), String> {
+    let off = autostart_off_file();
+    if on {
+        let _ = std::fs::remove_file(&off);
+    } else {
+        if let Some(dir) = off.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&off, "");
+    }
+    let failed = if on { t!("Couldn't turn on starting with your computer.") } else { t!("Couldn't turn off starting with your computer.") };
+    if flatpak() {
+        if on {
+            return enable_autostart().map_err(|_| failed.to_string());
+        }
+        linksy_host::remove(&flatpak_autostart());
+        linksy_host::remove(&portal_autostart());
+        stop_portal_autostart();
+        return Ok(());
+    }
+    show_xdg_entry(&xdg_entry(), system_xdg_entry(), on).map_err(|_| failed.to_string())?;
+    if unit_state().is_none() {
+        return Ok(());
+    }
+    let link = wants_link();
+    if on {
+        if masked(&link) {
+            let _ = std::fs::remove_file(&link);
+        }
+        return enable_autostart().map_err(|_| failed.to_string());
+    }
+    // Not --now: it goes on running until logout. disable removes a mask from before too,
+    // so it goes first.
+    systemctl(&["disable", "linksyd.service"]);
+    if unit_state().is_some_and(|s| enabled(&s)) {
+        let made = masked(&link) || (link.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::os::unix::fs::symlink("/dev/null", &link).is_ok());
+        if !made {
+            return Err(failed.to_string());
+        }
+        systemctl(&["daemon-reload"]);
+    }
+    Ok(())
+}
+
+/// Whether phones can be used by cable here: Err says why not.
+pub fn usb_ready() -> Result<(), String> {
+    if usb_rule() { Ok(()) } else { Err(t!("Allow it once: your computer asks for your password.").into()) }
+}
+
+/// What a Secure Boot restart asks for, in words: the exact steps, and the code to type.
+pub fn restart_steps(code: Option<&str>) -> String {
+    match code {
+        Some(code) => t!("Secure Boot asks you to approve the camera driver once.\n\n1. Restart your computer.\n2. A blue screen appears: choose Enroll MOK, then Continue, then Yes.\n3. Type this code: {code}\n4. Choose Reboot.\n\nLinksy Camera is then ready, nothing else to do. Write the code down: it's needed on that blue screen.", code),
+        None => t!("Restart your computer to finish. If a blue screen appears, choose Enroll MOK, then Continue, Yes, and Reboot. Then open Finish Setup again.").to_string(),
+    }
+}
+
+/// Where Linksy notes which version last offered Finish Setup by itself.
+fn offered_file() -> PathBuf {
+    config_file("setup-offered")
+}
+
+fn config_file(name: &str) -> PathBuf {
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))).unwrap_or_default();
+    config.join("linksy").join(name)
+}
+
+fn autostart_off_file() -> PathBuf {
+    config_file("autostart-off")
+}
+
+/// Whether starting with the computer was turned off in Preferences: then nothing turns
+/// it back on by itself.
+pub fn autostart_off() -> bool {
+    autostart_off_file().exists()
+}
+
+/// Phones someone watches rather than controls over the cable: they turned Take Control
+/// off. One device id per line, shared by both apps.
+pub fn watches_only(device: &str) -> bool {
+    std::fs::read_to_string(config_file("watch-only")).is_ok_and(|ids| ids.lines().any(|l| l == device))
+}
+
+pub fn set_watches_only(device: &str, on: bool) {
+    let path = config_file("watch-only");
+    let mut ids: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().filter(|l| *l != device && !l.is_empty()).map(String::from).collect();
+    if on {
+        ids.push(device.to_string());
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, ids.join("\n"));
+}
+
+/// The first time each `version` starts with something to set up: true once, to offer it.
+pub fn offer_now(ui: Ui, version: &str) -> bool {
+    if std::env::var_os("LINKSY_SCREENSHOT").is_some() || std::env::var_os("LINKSY_SOCKET").is_some() {
+        return false;
+    }
+    if std::fs::read_to_string(offered_file()).is_ok_and(|v| v.trim() == version) || actionable(&check(ui)).is_empty() {
+        return false;
+    }
+    if let Some(dir) = offered_file().parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(offered_file(), version);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distributions_that_hide_their_base_go_by_their_package_tool() {
+        let artix = "NAME=\"Artix Linux\"\nPRETTY_NAME=\"Artix Linux\"\nID=\"artix\"\nBUILD_ID=\"rolling\"\n";
+        assert_eq!(family_of(artix, |_| false), Family::Arch);
+        assert_eq!(family_of("ID=newdistro\n", |c| c == "pacman"), Family::Arch);
+        assert_eq!(family_of("ID=newdistro\n", |c| c == "zypper"), Family::Suse);
+        assert_eq!(family_of("ID=newdistro\n", |_| false), Family::Other);
+        assert_eq!(family_of("ID=ubuntu\nID_LIKE=debian\n", |c| c == "pacman"), Family::Debian);
+        assert_eq!(family_of("ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n", |_| false), Family::Suse);
+    }
+
+    #[test]
+    fn arch_headers_without_pkgbase_follow_the_name() {
+        assert_eq!(arch_headers("0.0.0-none-lts"), "linux-lts-headers");
+        assert_eq!(arch_headers("0.0.0-none"), "linux-headers");
+    }
+
+    #[test]
+    fn progress_reads_steps_and_codes() {
+        let mut p = Progress::default();
+        assert!(p.line("STEP Making the Linksy Camera").is_some());
+        assert!(p.line("ENROLL 12345678").is_none());
+        assert!(matches!(p.finish(4), Err(Failure::Restart(Some(c))) if c == "12345678"));
+    }
+
+    #[test]
+    fn xdg_entries_hide_and_show_again() {
+        let dir = std::env::temp_dir().join(format!("linksy-setup-xdg-{}", std::process::id()));
+        let path = dir.join("autostart/linksyd.desktop");
+        // Nothing to hide
+        show_xdg_entry(&path, false, false).unwrap();
+        assert!(!path.exists());
+        assert_eq!(xdg_shown(&path, false), None);
+        // The system's, hidden by one of the user's, removed again
+        assert_eq!(xdg_shown(&path, true), Some(true));
+        show_xdg_entry(&path, true, false).unwrap();
+        assert_eq!(xdg_shown(&path, true), Some(false));
+        show_xdg_entry(&path, true, true).unwrap();
+        assert!(!path.exists());
+        // The tarball's, which stays
+        let tarball = "[Desktop Entry]\nType=Application\nName=Linksy service\nExec=/home/u/.local/bin/linksyd\nX-systemd-skip=true\n";
+        std::fs::write(&path, tarball).unwrap();
+        show_xdg_entry(&path, false, false).unwrap();
+        assert_eq!(xdg_shown(&path, false), Some(false));
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("[Desktop Entry]\nHidden=true\n"));
+        show_xdg_entry(&path, false, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().matches("Hidden").count(), 1);
+        show_xdg_entry(&path, false, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), tarball);
+        // Hidden by the desktop's own settings, then shown here
+        std::fs::write(&path, format!("{tarball}Hidden = true\n")).unwrap();
+        assert_eq!(xdg_shown(&path, false), Some(false));
+        show_xdg_entry(&path, false, true).unwrap();
+        assert_eq!(xdg_shown(&path, false), Some(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_link_to_dev_null_masks() {
+        let dir = std::env::temp_dir().join(format!("linksy-setup-mask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("linksyd.service");
+        assert!(!masked(&link));
+        std::os::unix::fs::symlink("/usr/lib/systemd/user/linksyd.service", &link).unwrap();
+        assert!(!masked(&link));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        assert!(masked(&link));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

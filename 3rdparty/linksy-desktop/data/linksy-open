@@ -1,0 +1,11 @@
+#!/bin/sh
+# Opens KDE Connectify / Linksy's window.
+here=$(dirname "$(readlink -f "$0")")
+has() { [ -x "$here/$1" ] || command -v "$1" >/dev/null 2>&1; }
+run() { app=$1; shift; if [ -x "$here/$app" ]; then exec "$here/$app" "$@"; else exec "$app" "$@"; fi; }
+
+has kdeconnectify && run kdeconnectify "$@"
+has linksy-qt && run linksy-qt "$@"
+has linksy-app && run linksy-app "$@"
+echo "kdeconnectify: neither kdeconnectify, linksy-qt nor linksy-app is installed" >&2
+exit 1

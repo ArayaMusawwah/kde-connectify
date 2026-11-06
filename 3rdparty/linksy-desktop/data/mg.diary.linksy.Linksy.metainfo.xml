@@ -1,0 +1,438 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>mg.diary.linksy.Linksy</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>Linksy</name>
+  <summary>Your devices, connected</summary>
+  <developer id="mg.diary.linksy">
+    <name>Linksy</name>
+  </developer>
+  <description>
+    <p>
+      Linksy connects your computer and phone directly over your own network. No account,
+      no cloud, no server: what you share goes straight from one device to the other.
+    </p>
+    <ul>
+      <li>Send files and folders, or drop them anywhere in the window</li>
+      <li>Send your clipboard to another device</li>
+      <li>See and control another computer's screen, or watch your phone's</li>
+      <li>Use a tablet or phone as a second display</li>
+      <li>Use your phone's camera as a webcam in any app</li>
+      <li>Open links from your phone, see its battery, and ring it to find it</li>
+      <li>Control this computer's music from your phone; calls pause it</li>
+      <li>Import your phone's photos automatically</li>
+      <li>Use your phone as a touchpad, keyboard and presentation remote</li>
+      <li>Browse a folder of your phone in the Files app</li>
+      <li>Ping a device, and see everything you shared as a timeline</li>
+    </ul>
+    <p>
+      Pair once by scanning a QR code. Devices nearby show up on their own, and connect only
+      when there is something to share, to save battery.
+    </p>
+  </description>
+  <launchable type="desktop-id">mg.diary.linksy.Linksy.desktop</launchable>
+  <url type="homepage">https://linksy.diary.mg</url>
+  <url type="bugtracker">https://github.com/LinkSy-mg/linksy-releases/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>A phone's page: send files, see its screen, or use it as a second display, webcam or microphone</caption>
+      <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/device.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The phone's chats, texts and mail in one Inbox, answered from the computer</caption>
+      <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/inbox.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Lay out the phone's deck of buttons for the computer</caption>
+      <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/deck-editor.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Pair a device by scanning a QR code</caption>
+      <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/pair.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>In dark style</caption>
+      <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/device-dark.png</image>
+    </screenshot>
+  </screenshots>
+  <branding>
+    <color type="primary" scheme_preference="light">#a8c0ff</color>
+    <color type="primary" scheme_preference="dark">#1438b8</color>
+  </branding>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+  <keywords>
+    <keyword>share</keyword>
+    <keyword>send</keyword>
+    <keyword>transfer</keyword>
+    <keyword>phone</keyword>
+    <keyword>android</keyword>
+    <keyword>nearby</keyword>
+  </keywords>
+  <releases>
+    <release version="0.12.4" date="2026-11-04">
+      <description>
+        <p>Fixes: clicking or swiping away a phone's notification no longer stops Linksy in the background, and the Gallery drops photos deleted on the phone right away.</p>
+      </description>
+    </release>
+    <release version="0.12.3" date="2026-11-03">
+      <description>
+        <p>Lighter at rest: the window no longer keeps redrawing while it looks for devices or while a transfer waits to start, and a phone's page checks how fast it answers only while you're using the window.</p>
+      </description>
+    </release>
+    <release version="0.12.2" date="2026-11-03">
+      <description>
+        <p>Starting at login can be turned off in Preferences, and the Qt app for KDE Plasma is redesigned in Plasma's own style: a calmer phone page with one bar of everyday actions, cards with their actions in a section of their own, and Breeze's one-colour icons, in light and Breeze Dark.</p>
+      </description>
+    </release>
+    <release version="0.12.1" date="2026-11-03">
+      <description>
+        <p>A device's page in tabs, with a file manager for the phone's shared folder, an Inbox with the phone's other notifications and earlier messages, a Gallery of its photos and videos, and the Deck: the phone as buttons for this computer, with an editor in the GTK app to lay it out. The Inbox's new parts, the Gallery and the Deck need a coming version of Linksy for Android. Also fixed: with two phones, control goes only to the one on the cable you're viewing, and a pulled cable is noticed at once.</p>
+      </description>
+    </release>
+    <release version="0.11.4" date="2026-11-02">
+      <description>
+        <p>Messages: a phone's chats, texts and mail in one place, made from its notifications, with answers from the computer when the app allows it. Verification codes that arrive in messages go straight to the clipboard (this can be turned off), and the Qt app gets Phone Notifications in Preferences.</p>
+      </description>
+    </release>
+    <release version="0.11.3" date="2026-11-01">
+      <description>
+        <p>A lighter window: with a phone's page open, the app uses about a fifth less memory, and a device's page opens faster. Away From Home turned off now closes the connection to the relay at once, and distributions can build Linksy without it.</p>
+      </description>
+    </release>
+    <release version="0.11.2" date="2026-11-01">
+      <description>
+        <p>Lighter in the background: Linksy is built for size, with file transfers, encryption and checksums kept at full speed, so the background service uses about a fifth less memory at rest. In the Qt app, the devices column can be dragged wider or narrower and keeps its width.</p>
+      </description>
+    </release>
+    <release version="0.11.1" date="2026-11-01">
+      <description>
+        <p>The GTK app brings the few icons that KDE's Breeze and some other icon themes lack, so no button shows a broken image. In the Qt app, the "Use as" cards come back after a camera preview and keep their text clear of the Start button after a resize. Linksy's own password prompt starts with the cursor in the password field.</p>
+      </description>
+    </release>
+    <release version="0.11.0" date="2026-10-31">
+      <description>
+        <p>Control a phone from the computer over the USB cable, with no developer options: Take Control on a plugged-in phone's screen plugs a virtual touchscreen and keyboard into it, so clicks, scrolling, keys (in the phone's own layout) and text work, and the phone stays awake while you use it. The cable itself checks its connection, retries when a phone is slow to switch, and recognises phones from more makers.</p>
+      </description>
+    </release>
+    <release version="0.10.1" date="2026-10-30">
+      <description>
+        <p>Where no password prompt runs (Openbox, Hyprland, Sway and other desktops without a polkit agent), Linksy asks for the password itself, for Finish Setup and Update Now, instead of starting another program's prompt in the session. A wrong password can be typed again.</p>
+      </description>
+    </release>
+    <release version="0.10.0" date="2026-10-30">
+      <description>
+        <p>The phone sees and controls X11 screens (Openbox, XFCE, i3, MATE) without a screen sharing portal, and controls the screen on Hyprland and Sway through their virtual pointer and keyboard. The Flatpak now does everything the packages do: Finish Setup, the terminal for phones, Update Now and Send with Linksy. A new page lists everything Linksy needs for installing it by hand, and Finish Setup stops waiting for a password after two minutes.</p>
+      </description>
+    </release>
+    <release version="0.9.17" date="2026-10-29">
+      <description>
+        <p>Send with Linksy in Thunar's Send To menu and GNOME Files' right-click menu. The microphone card shows what the phone hears as a live wave, in place of Listen. Device names can't hold markup anywhere, and on Manjaro Finish Setup installs the running kernel's headers for the camera driver, from the Flatpak too.</p>
+      </description>
+    </release>
+    <release version="0.9.16" date="2026-10-28">
+      <description>
+        <p>Names from other devices show as plain text in the Qt app, so a device can't make Linksy fetch a picture from the internet or disguise its name. After Update Now, "Linksy X Is Available" goes away even in a window opened from an older tray.</p>
+      </description>
+    </release>
+    <release version="0.9.15" date="2026-10-28">
+      <description>
+        <p>Linksy's private files (the pairing key, your paired devices, the history) are no longer readable by other accounts on the computer, and the terminal code's lockout holds when many guesses arrive at once. Send with Linksy in Dolphin's right-click menu, Open With Linksy works on KDE Plasma, and the camera driver builds for custom Fedora kernels.</p>
+      </description>
+    </release>
+    <release version="0.9.14" date="2026-10-28">
+      <description>
+        <p>View Screen and Send Clipboard in the tray menu, and Show Linksy raises the open window instead of opening another. Device names from other devices are cleaned, so they can't disguise a pairing prompt. On Artix and other Arch-based systems, Finish Setup installs what's missing; the camera setup asks for mokutil when Secure Boot needs it.</p>
+      </description>
+    </release>
+    <release version="0.9.13" date="2026-10-27">
+      <description>
+        <p>Safer pairing codes: someone on the same network can no longer steer both screens to the same code. Linux without systemd (Artix, Void, Gentoo): Linksy Camera stays after a restart, Finish Setup gives tiling compositors the line that starts Linksy at login, and Restart Now works.</p>
+      </description>
+    </release>
+    <release version="0.9.12" date="2026-10-27">
+      <description>
+        <p>Taps on a scaled KDE second display land where you tap, the cursor shows at once after a tap on a still screen, and Linksy reconnects far sooner after a network switch. The service uses about a quarter less memory at rest, and less still until a device can reach it from away or after big transfers.</p>
+      </description>
+    </release>
+    <release version="0.9.11" date="2026-10-26">
+      <description>
+        <p>Transfers like on the phone: a page with the speed, each file and its progress, a panel in the corner on every page, and Send Files and Add Device together at the bottom of your devices. A phone can ask to pick which screen it sees.</p>
+      </description>
+    </release>
+    <release version="0.9.10" date="2026-10-26">
+      <description>
+        <p>Always Allow: a device of yours can see and control this screen without asking each time, from its prompt or a switch on its page; Linksy still tells you when it starts. Taps on KDE's extended screen land where you tap when the display is scaled, paired devices no longer stay "not nearby", and the packages install one file at a time.</p>
+      </description>
+    </release>
+    <release version="0.9.9" date="2026-10-25">
+      <description>
+        <p>Wi-Fi Direct: big files go straight from your phone to this computer over a Wi-Fi link of their own, at about 80 MB/s, four times faster than through the router, while the computer stays on its network (with the Linksy for Android update). Transfers are steadier on busy Wi-Fi.</p>
+      </description>
+    </release>
+    <release version="0.9.8" date="2026-10-24">
+      <description>
+        <p>A paired phone can now follow and set this computer's volume (with a phone app update). The tray menu's icons are one colour, like the rest of the top bar.</p>
+      </description>
+    </release>
+    <release version="0.9.7" date="2026-10-24">
+      <description>
+        <p>Linksy sits in the system tray on every desktop that has one, with your devices and what they can do in its menu. Cover art from browsers reaches the phone, and the phone camera's driver is really rebuilt with the enrolled Secure Boot key.</p>
+      </description>
+    </release>
+    <release version="0.9.6" date="2026-10-24">
+      <description>
+        <p>Second Display works on KDE, at the size KDE gives its virtual monitor, and the phone's pointer reaches the screen's edges there. Keys held from the phone are released when it disconnects, and the phone camera's driver is rebuilt with the Secure Boot key already enrolled.</p>
+      </description>
+    </release>
+    <release version="0.9.5" date="2026-10-24">
+      <description>
+        <p>Second Display goes through the graphics chip when it can encode video, at up to 60 frames a second with almost no processor. On Fedora with AMD graphics, Finish Setup adds the full driver this needs.</p>
+      </description>
+    </release>
+    <release version="0.9.4" date="2026-10-24">
+      <description>
+        <p>Second Display is smooth when Linksy runs as a service: screen sharing gets a memory limit of its own instead of the service's small one. A second display that froze after changing GNOME's display settings now starts again by itself, and screen helpers no longer outlive a crashed service.</p>
+      </description>
+    </release>
+    <release version="0.9.3" date="2026-10-24">
+      <description>
+        <p>Second Display is smooth on laptops without a hardware video encoder: 30 frames a second, and sharp.</p>
+      </description>
+    </release>
+    <release version="0.9.2" date="2026-10-24">
+      <description>
+        <p>Second Display no longer lags on computers without a hardware video encoder: it runs at up to 30 frames a second on several processor cores. In the Flatpak, Save Logs now includes the service's log.</p>
+      </description>
+    </release>
+    <release version="0.9.1" date="2026-10-24">
+      <description>
+        <p>After Update Now, Linksy starts again by itself. What's New lists the highlights of every version since the one you last used, each under its own heading.</p>
+      </description>
+    </release>
+    <release version="0.9.0" date="2026-10-24">
+      <description>
+        <p>Linksy runs on more computers: Ubuntu 24.04 and Linux Mint 22, and Hyprland, Sway, niri and X11 desktops, with a second display on Hyprland and Sway, the installed screen locker for Lock When Away, and Finish Setup that knows what these desktops lack. On public Wi-Fi Linksy no longer announces the computer's name. Files sent together ask once, and Always Accept saves a device's files without asking. Save Logs gathers what's needed for a bug report.</p>
+      </description>
+    </release>
+    <release version="0.8.7" date="2026-10-23">
+      <description>
+        <p>Plugging a phone in to charge no longer asks anything: Connect by USB Cable uses the cable when you want it, and a phone can be set to use it automatically. In the Flatpak, Finish Setup gives the one command that adds the webcam for every app, and the USB guide the one for the cable. Second Display says clearly when the desktop can't make a virtual monitor (Hyprland, Sway) instead of failing.</p>
+      </description>
+    </release>
+    <release version="0.8.6" date="2026-10-23">
+      <description>
+        <p>Update in one click: when a new version is out, Update Now downloads it, checks it against the release, installs it with one password and starts Linksy again. In a terminal, linksy upgrade does the same, and linksy --version and --revision tell exactly which Linksy this is.</p>
+      </description>
+    </release>
+    <release version="0.8.5" date="2026-10-23">
+      <description>
+        <p>Each update now shows what it brings the first time it opens. Installing Linksy always brings its window: the service package now comes with the GTK app, or the Plasma app when that's the one chosen. Answering a request in a notification or in the app takes the notification away.</p>
+      </description>
+    </release>
+    <release version="0.8.4" date="2026-10-23">
+      <description>
+        <p>A Linksy for KDE Plasma: the same app made with Qt and Kirigami, in Breeze. Packages are now split into the service and tools, and the app for your desktop. You can use a relay you host yourself. The phone's camera works on CachyOS and other Arch-based kernels, where Finish Setup now installs the right headers and the camera tool.</p>
+      </description>
+    </release>
+    <release version="0.8.3" date="2026-10-22">
+      <description>
+        <p>Linksy is open source, under the GNU AGPL v3.0 or later. There is an .rpm for openSUSE, and Finish Setup knows openSUSE, including Aeon, Kalpa and MicroOS. Controlling the computer from the phone works again when the remembered screen choice went stale, and screen sharing works on Intel Kaby Lake GPUs. openSUSE no longer asks for the administrator's password at every start, and opening the firewall works with firewalld 2.x.</p>
+      </description>
+    </release>
+    <release version="0.8.2" date="2026-10-22">
+      <description>
+        <p>The phone's camera shows in OBS's camera source and other PipeWire apps by name, not as a blank entry.</p>
+      </description>
+    </release>
+    <release version="0.8.1" date="2026-10-22">
+      <description>
+        <p>A phone whose Linksy app doesn't take the USB cable is no longer switched again and again; the Connect by USB Cable guide says what happened.</p>
+      </description>
+    </release>
+    <release version="0.8.0" date="2026-10-22">
+      <description>
+        <p>Linksy speaks ten languages, the same as Linksy for Android. A Connect by USB Cable guide walks through using a phone over a cable. The microphone card shows a live level with Listen and Stop. Finish Setup installs what's missing on KDE and other desktops too, with one password.</p>
+      </description>
+    </release>
+    <release version="0.7.2" date="2026-10-22">
+      <description>
+        <p>Updating from Linksy 0.6.0 or older now restarts the old background service, so the new version's features show at once.</p>
+      </description>
+    </release>
+    <release version="0.7.1" date="2026-10-22">
+      <description>
+        <p>The terminal is set up from the phone's page, in a card that says what's next. Preferences always open, even right after an update.</p>
+      </description>
+    </release>
+    <release version="0.7.0" date="2026-10-22">
+      <description>
+        <p>Terminal from your phone: a shell on this computer, behind a code you set, allowed per phone, ended from either side. Set Up Everything: Finish Setup checks the firewall, autostart and screen sharing too, and fixes it all with one password.</p>
+      </description>
+    </release>
+    <release version="0.6.4" date="2026-10-21">
+      <description>
+        <p>Received files go to Downloads/Linksy by default. The device page fits any window size.</p>
+      </description>
+    </release>
+    <release version="0.6.3" date="2026-10-21">
+      <description>
+        <p>The screen viewer explains a black status bar when watching some Android phones, and how to fix it on the phone.</p>
+      </description>
+    </release>
+    <release version="0.6.2" date="2026-10-21">
+      <description>
+        <p>A redesigned device page: battery ring, a big Send Files area, one-click tiles, Use As cards for display, webcam and microphone, and a filterable activity timeline. The device list can shrink to a strip of pictures (F9).</p>
+      </description>
+    </release>
+    <release version="0.6.1" date="2026-10-21">
+      <description>
+        <p>Updates take effect right away: the background service restarts into the new version instead of running the old one until you log out.</p>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-10-21">
+      <description>
+        <p>Away from home: paired devices reach each other over the internet, end-to-end encrypted, for a week after they were last on the same Wi-Fi; screens, files, camera and microphone stay local unless allowed. Locate your phone. 1080p webcam. Linksy is now freeware.</p>
+      </description>
+    </release>
+    <release version="0.5.9" date="2026-10-21">
+      <description>
+        <p>A phone's camera can be used at 60 frames per second.</p>
+      </description>
+    </release>
+    <release version="0.5.8" date="2026-10-21">
+      <description>
+        <p>Linksy tells you when a new version is out, offers to reconnect a second display that dropped, and asks again when remote control wasn't allowed.</p>
+      </description>
+    </release>
+    <release version="0.5.7" date="2026-10-21">
+      <description>
+        <p>Use a phone as a microphone, connect it with a USB cable for lower latency, control its camera from the computer, and see device pictures. The webcam shows up about 0.4 seconds sooner.</p>
+      </description>
+    </release>
+    <release version="0.5.6" date="2026-10-21">
+      <description>
+        <p>Copied images and files go to the other device's clipboard, and text copied here can reach a phone on its own (not on GNOME).</p>
+      </description>
+    </release>
+    <release version="0.5.5" date="2026-10-21">
+      <description>
+        <p>A phone used as a second display gets a monitor in its own shape, filling its screen.</p>
+      </description>
+    </release>
+    <release version="0.5.4" date="2026-10-21">
+      <description>
+        <p>Only what each device can do is offered; a phone's shared folder is named in Files.</p>
+      </description>
+    </release>
+    <release version="0.5.3" date="2026-10-21">
+      <description>
+        <p>Finish Setup installs what features need in one click, and the phone's camera now shows up in browsers and Zoom too.</p>
+      </description>
+    </release>
+    <release version="0.5.2" date="2026-10-20">
+      <description>
+        <p>Flatpak: fewer permissions.</p>
+      </description>
+    </release>
+    <release version="0.5.1" date="2026-10-20">
+      <description>
+        <p>Your phone in the Files sidebar: browse it like a USB drive.</p>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-10-20">
+      <description>
+        <p>Texting from the desktop: read and send your phone's text messages.</p>
+      </description>
+    </release>
+    <release version="0.4.1" date="2026-10-20">
+      <description>
+        <p>Use your phone as a touchpad, keyboard and presentation remote.</p>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-10-20">
+      <description>
+        <p>Photo auto-import: your phone's new photos land in your Pictures folder.</p>
+      </description>
+    </release>
+    <release version="0.3.2" date="2026-10-20">
+      <description>
+        <p>Lock When Away: this computer locks itself when your phone leaves.</p>
+      </description>
+    </release>
+    <release version="0.3.1" date="2026-10-20">
+      <description>
+        <p>Music and videos here pause while you're on a phone call, and resume after.</p>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-10-20">
+      <description>
+        <p>Media controls both ways: your phone's music in GNOME's media controls, and this computer's music on your phone.</p>
+      </description>
+    </release>
+    <release version="0.2.3" date="2026-10-20">
+      <description>
+        <p>Using a phone as a second display no longer shows a black screen.</p>
+      </description>
+    </release>
+    <release version="0.2.2" date="2026-10-20">
+      <description>
+        <ul>
+          <li>Your phone's notifications on this computer, with Reply</li>
+          <li>The background service quits right away when asked</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-10-20">
+      <description>
+        <ul>
+          <li>Your phone's battery level, with a heads-up when it runs low</li>
+          <li>Ring your phone to find it, even on silent</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-10-20">
+      <description>
+        <ul>
+          <li>Open on PC: links shared from your phone open in this computer's browser</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.2" date="2026-10-20">
+      <description>
+        <ul>
+          <li>Use as Webcam works in OBS and other apps that pick a camera's format</li>
+          <li>The Flatpak starts its background service by itself, and at every login</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.1" date="2026-10-20">
+      <description>
+        <ul>
+          <li>Now also as Flatpak, .deb and .rpm packages</li>
+          <li>Screen windows fit the shared screen's shape, with no black bars</li>
+          <li>Preview a device's camera right in the app</li>
+          <li>Clearer messages when the other device can't do something yet</li>
+          <li>Closing Linksy never hangs on a device that went quiet</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-10-19">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

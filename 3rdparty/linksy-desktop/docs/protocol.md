@@ -1,0 +1,2456 @@
+# Linksy mobile handoff
+
+This document is for whoever builds the Linksy phone app (Flutter, Android first). It
+describes the product, what the desktop side already does, the exact wire protocol the
+phone must speak, and what is still missing. It is updated every time the desktop side
+changes; see the [changelog](#changelog) at the end.
+
+Repository: `LinkSy-mg/linksy-desktop` (this repo). Desktop code is Rust; the Linux app
+is GTK4/libadwaita.
+
+---
+
+## 1. Product in one page
+
+**Linksy — Your devices, connected.** Local-first sharing between your own devices: no
+accounts, no cloud, no relay server. Devices on the same network find each other, pair
+once with a 6-digit code, then share files, clipboard text and notifications directly.
+
+Decisions already made with the owner:
+
+- **Platforms:** Linux desktop first, **Android** is the phone platform. iPhone, macOS and
+  Windows come later.
+- **Native feel on each platform.** On Android that means Material You (dynamic color,
+  Material 3 components, predictive back, edge-to-edge), not a desktop look.
+- **Lightweight above all.** Small install, tiny idle footprint, no background work
+  unless there is something to do.
+- **Battery:** devices *always know who is nearby* but only *connect when there is
+  something to share* (see §4.6). No always-on connection by default.
+- **Brand:** the logo is the "Sender" mark (a larger dot with an arc handing off to a
+  smaller one) in `brand/logo/`. The palette is **Signal**: blue `#2563FF` (sender,
+  accent), cyan `#22C3E6` (receiver), deep `#1438B8`. Use `#2563FF` as the Material You
+  seed color; `brand/logo/logo.png` is a 1024×1024 export on white.
+
+## 2. Feature status
+
+Desktop column: Linksy for Linux 0.12.4. Android column: the phone's `docs/android-app.md`
+(LinkSy-mg/linksy-mobile, phone 0.3.4, 2026-11-05). "Not possible" rows are hidden by the
+desktop for Android phones (see §4.10). Work that is on main but not in a
+release yet says so in its row. What's still ahead, in order, is in `ROADMAP.md`.
+
+| Feature | Desktop (Linux) | Android | Notes |
+|---|---|---|---|
+| Discovery, presence, pairing (code, address, QR) | Done | Done | §4.1, §4.6, §4.7 |
+| Files and folders, accept/decline, resume | Done | Done | §4.5; phone saves to Downloads/Linksy |
+| Clipboard text (on demand), ping, rename | Done | Done | |
+| Open on PC (`open_url`) | Done | Done, both ways | §4.5 |
+| Battery, Ring / Find | Done | Done | §4.5 |
+| The computer's music on the phone | Done | Done | `media_watch`, `media_state`, `media_command` |
+| The computer's volume on the phone | Done (0.9.8) | Done (0.2.6) | `volume_watch`, `volume_state`, `volume_set` (§4.5) |
+| The phone's music on the computer | Done | To do | `MediaSessionManager` needs the notification listener, which the app has had since 0.3.2: possible, not built |
+| Pause the computer's media during calls | Done | Done | `call_state`; never a `contact` |
+| Lock when away | Done | Done | `heartbeat`; foreground service |
+| Photo auto-import | Done | Done | one folder the user picks, `YYYY-MM` folders |
+| Phone in the Files sidebar | Done | Done (one folder) | `fs`, §4.9; `info` gives the folder name |
+| Touchpad, keyboard, slides | Done | Done | session `input`, §4.8 |
+| Phone shares its screen | Done | Done | `screen` |
+| Phone as webcam | Done | Done | `camera`; desktop: V4L2 "Linksy Camera" with v4l2loopback |
+| Phone as second display | Done | Done | `display`; at the phone's shape since desktop 0.5.5 |
+| Phone watches / controls the computer | Done | Done | phone requests `screen` / `control` |
+| Controlling the phone from the computer | Done, over the cable (0.11.0) | Nothing to do over the cable; not planned without it | over the cable the computer plugs a virtual touchscreen into the phone (§4.11); without it the phone would need an AccessibilityService, which is blocked for sideloaded apps |
+| Texting from the computer | Done | Not possible | SMS permissions are blocked for sideloaded apps |
+| Phone notifications on the computer, reply | Done | Done (0.3.2) | a notification listener, on once the user allows Notification access (Android 13 and later: Allow restricted settings first); texts come this way, not through SMS permissions |
+| Messages page, codes copied | Done (0.11.4) | Done (0.3.2) | from message notifications; `conversation`, `sender`… (§4.5) |
+| Inbox: other notifications, earlier messages, replies after the notification | Done (0.12.1) | Done (0.3.3) | `messages`, `reply_kept`, `inbox_history` (§4.5) |
+| Gallery: the phone's photos page by page | Done (0.12.1) | Done (0.3.3) | `gallery` stream, thumbnails, `send` (§4.18) |
+| Deck: the phone as buttons for the computer | Done (0.12.1) | Done (0.3.3) | `deck_open`, `deck_actions`, `deck_run` (§4.19) |
+| Deck layouts made on the computer | Done (0.12.1) | Done (0.3.3) | `deck_layout`, feature `deck_layout` (§4.20) |
+| Images/files on the clipboard | Done | Done | offer with `"clipboard":true` (§4.5) |
+| Automatic clipboard sync, computer → phone | Done (not on GNOME) | Done (phone asks) | `clipboard_watch` (§4.5) |
+| Phone as microphone | Done | Done | session `microphone`, raw PCM (§4.8) |
+| USB cable (no Wi-Fi, lower latency) | Done (cable v2, 0.11.0) | Works on some phones, not yet every one | Android Open Accessory + UDP bridge (§4.11); a Samsung A05 connects since phone 0.3.3 but lags (releases#8); the plan to make it work everywhere is in `ROADMAP.md` |
+| Camera controls from the computer | Done | Done | §4.8; docs/android-app.md §2.8 |
+| Device pictures | Done | Done | §4.5; docs/android-app.md §2.7 |
+| Away from home (over the internet) | Done | Done | iroh, Linksy's relay, 7-day lease (§4.13) |
+| Locate the phone | Done | Done (while the app is open) | `locate` / `location` (§4.14) |
+| 1080p webcam | Done | Done | `size` in `camera_control`, `size_options` (§4.8) |
+| Terminal on the computer, from the phone | Done (0.7.0) | Done (0.2.0), hard to use (mobile#2) | session `terminal`, code set on the computer (§4.15) |
+| Direct link (Wi-Fi Direct) for big transfers | Done (0.9.9) | Done (0.2.8); between two phones 0.2.9 | phone hosts, computer joins with NetworkManager (§4.17); full speed only when both pick the same channel (`ROADMAP.md`) |
+| Choose Screen (see another monitor) | Done (0.9.11) | Done (0.2.12) | `choose` in `session_request` (§4.8) |
+| Turn on the Inbox or Gallery from the computer | On main (not released) | Built, waits for the core pin that has it | `turn_on` (§4.21) |
+| Phone to phone: the route, a check before sending, apps | On main (not released) | In progress | §4.22 |
+| Position and seeking of the computer's players | On main (not released) | Nothing to do | the computer counts a browser's position itself and seeks exactly (§4.5) |
+| Snap: take a photo on the phone, it lands on the computer | To do (Now) | Built, not published | an ordinary file transfer, then `clipboard_file` where the computer announces it; the computer's "Snap from Phone" needs a new message |
+| Copy to Computer (text from the phone's text menu) | Receives `clipboard` as before | Built, not published | to confirm against the phone's messages once they are published |
+| A USB button on the phone | Done (0.9) | Built, not published | `usb_plugged`, `usb_connect` (§4.11); mobile#11 |
+| Connection Doctor | To do (Now) | Its half built, not published | the computer checks its firewall, a VPN, devices kept apart and the cable |
+| The phone's controls on the computer (volumes, ringer, Do Not Disturb, flashlight) | To do (Now) | To do | messages to agree on first |
+| Bluetooth (presence and a link) | Planned | Planned | `ROADMAP.md`; not started |
+
+## 3. How to build the phone app (recommendation)
+
+**Use the Rust core through `flutter_rust_bridge`; do not reimplement the protocol in
+Dart.** The protocol needs QUIC with TLS 1.3 *mutual* authentication using self-signed
+certificates, a custom certificate verifier, and a TLS keying-material exporter for the
+pairing code. Dart's `dart:io` has no QUIC and no exporter API, and a second
+implementation would drift. Reusing `crates/linksy-core` gives byte-identical behavior
+with the desktop.
+
+- Build `linksy-core` for `aarch64-linux-android`, `armv7-linux-androideabi`,
+  `x86_64-linux-android` (e.g. with `cargo-ndk`). It uses `ring`, `quinn`, `rustls`,
+  `mdns-sd`, `tokio`: all build for Android.
+- Wrap the `Node` API (§5) in a thin bridge crate inside the Flutter project, not in
+  `linksy-core` itself.
+- Run the node inside an Android **foreground service** while a transfer or prompt is in
+  progress; otherwise let the system sleep. Presence (mDNS) needs a
+  `WifiManager.MulticastLock` while the app is in use.
+- Store `cert.der`, `key.der`, `trusted.json` and `settings.json` in the app's private
+  files dir (`Config::data_dir`). The key file must stay private.
+
+Things the core still needs for Android (desktop side will add them; tracked in §7):
+
+1. **Sending from `content://` URIs.** `Node::send_files` takes file paths. Android share
+   intents give content URIs. Planned: an API that takes open file descriptors / readers
+   with a name and size.
+2. **Receiving into MediaStore.** Received files go to `Settings::download_dir`. On
+   Android point it at an app-specific dir and move finished files into
+   `MediaStore.Downloads`, or wait for a "save via callback" API.
+3. **Discovery from the platform.** Available: if raw multicast is unreliable on some
+   phones, browse with `NsdManager` (service `_linksy._udp.`), read the TXT record
+   (§4.1) and call `node.device_found(device, addrs)` / `node.device_lost(id)`. Start
+   the node with `Config::discovery = false` in that case. (Advertising still has to be
+   done too: register the same service with `NsdManager`.)
+
+## 4. Wire protocol (version 1)
+
+Everything here is implemented in `crates/linksy-core`; source references are given so
+details can be checked.
+
+### 4.1 Discovery (mDNS / DNS-SD) — `src/discovery.rs`
+
+- Service type: `_linksy._udp.local.`
+- Instance name: `"<device name> <SHORT-ID>"`, e.g. `Studio Desktop EBB0-9CE2`.
+- Host name: `linksy-<short id lowercase>.local.`, e.g. `linksy-ebb0-9ce2.local.`
+- Port: the device's QUIC UDP port. Desktop default **47200**, random if taken.
+- TXT records:
+
+  | key | value |
+  |---|---|
+  | `id` | full device id: 64 lowercase hex chars (§4.2) |
+  | `name` | device name (≤ 48 chars) |
+  | `kind` | `desktop`, `laptop`, `phone` or `tablet` |
+  | `os` | `linux`, `android`, `macos`, `windows`, … |
+  | `v` | protocol version, `1` |
+
+- TXT data is only a hint. Identity is always proven by TLS (§4.2); never trust a TXT
+  `id` for anything but display and choosing whom to dial.
+- A device leaving cleanly sends an mDNS goodbye. Presence is re-checked every 45 s by
+  re-querying each visible instance; no answer → the device is gone.
+- On rename, the old instance is unregistered (goodbye) and a new one registered.
+- **Replaced in desktop 0.9 by private discovery (§4.16):** no id, name or OS on the
+  network any more, except while a device is being added. This record stays only for
+  paired devices that haven't moved to §4.16 yet.
+
+### 4.2 Identity — `src/identity.rs`
+
+- Each install generates a **self-signed X.509 certificate** with an **ECDSA P-256 /
+  SHA-256** key (rcgen defaults), SAN `linksy`.
+- **Device id = SHA-256 of the certificate DER**, shown as 64 lowercase hex chars.
+- **Short id** = first 4 bytes of the id, uppercase hex, split `XXXX-XXXX`.
+- The id never changes for an install. Paired devices pin it.
+
+### 4.3 Transport and TLS — `src/tls.rs`
+
+- **QUIC** (RFC 9000) over UDP, **TLS 1.3 only**, **ALPN `linksy/1`**, SNI `linksy`.
+- **Mutual TLS:** both sides present their device certificate. Each side accepts any
+  certificate whose TLS 1.3 handshake signature verifies, then computes the peer id from
+  the presented certificate and checks it (§4.4).
+- Transport settings used by desktop: stream receive window 16 MiB, connection receive
+  window 32 MiB, send window 32 MiB, keep-alive every 10 s, idle timeout 30 s.
+- The UDP socket asks the kernel for 8 MiB send and receive buffers (core 0.9.9; Linux
+  gives about 200 KiB by default and caps the request at `net.core.rmem_max`). A burst at
+  Wi-Fi speed overflows a small buffer, and QUIC reads the drops as congestion.
+- **Pairing code (core 0.9.13):** TLS exporter (RFC 8446 §7.5) with label
+  `linksy pairing code v2`, context = dialer's nonce ‖ listener's nonce (32 bytes each,
+  §4.4), 8 bytes output. Interpret as a big-endian `u64`, take `% 1_000_000`, format as
+  6 digits with leading zeros. Display as `123 456`.
+- **Older devices** (no `pairing` in their `hello`/`welcome`) still pair: same code but
+  label `linksy pairing code v1` and an empty context. A man in the middle can steer
+  that one to match (it plays TLS server and retries its handshake until both codes
+  agree, about a million tries), so `pairing_request` then carries `"older":true` and
+  the apps add a calm line: "Updating Linksy on {name} makes pairing even safer."
+
+### 4.4 Framing and handshake — `src/protocol.rs`, `src/node.rs`
+
+**Framing:** every control message is a big-endian `u32` length followed by that many
+bytes of UTF-8 JSON. Maximum frame 1 MiB. Enums are tagged with `"type"` in snake_case.
+
+**Handshake:** the dialer opens the **first bidirectional stream** and sends `hello`:
+
+```json
+{"type":"hello","version":1,"intent":"connect","stay_connected":false,
+ "device":{"id":"<64 hex>","name":"Pixel 9","kind":"phone","os":"android"}}
+```
+
+- `intent`: `connect` (already paired), `pair` (start pairing), or `direct` (a second
+  connection over a direct link, §4.17; paired devices only, and it doesn't replace the
+  first).
+- `stay_connected` (optional, default `false`): the sender keeps links open, so the
+  receiver must not close this connection for being idle.
+- `invite` (optional, omitted when unused): the token from a scanned QR code (§4.7).
+
+The listener checks `device.id` equals the fingerprint of the TLS certificate (else
+closes with "identity mismatch") and answers:
+
+```json
+{"type":"welcome","stay_connected":false,
+ "device":{"id":"<64 hex>","name":"Studio Desktop","kind":"desktop","os":"linux"}}
+```
+
+or rejects:
+
+```json
+{"type":"reject","reason":"not_paired"}      // also "incompatible_version", "busy"
+```
+
+The dialer checks `welcome.device.id` equals the listener's certificate fingerprint.
+For `intent: connect`, a dialer also refuses (closes) if the peer isn't in its trust
+list.
+
+Both `hello` and `welcome` carry `"pairing":2` (core 0.9.13). Older versions leave it
+out.
+
+**Names from other devices** (core 0.9.14, desktop#55): in `hello`, `welcome`, discovery,
+QR codes and renames, the core drops control, bidi and invisible characters, collapses
+spaces and cuts the name at 48 characters. A handshake or discovery name left empty
+becomes the short id. Since core 0.9.17, `<` and `>` become `‹` and `›` (U+2039, U+203A),
+so no name reads as a tag where a toolkit guesses rich text (desktop#63). Apps show
+`device.name` as it comes.
+
+**Commit and reveal** (after `welcome`, on the same stream, only when both sent
+`"pairing":2`; QR pairing does it too). Each side makes a 32-byte random nonce:
+
+```json
+{"type":"pair_commit","commit":"<64 hex: SHA-256 of the listener's nonce>"}  // listener
+{"type":"pair_nonce","nonce":"<64 hex>"}                                      // dialer
+{"type":"pair_nonce","nonce":"<64 hex>"}                                      // listener
+```
+
+The dialer checks the listener's nonce against the commitment and drops the connection
+if it doesn't match. Neither side picks its nonce after seeing the other's, so a man in
+the middle gets one chance in a million per attempt, and every attempt either shows on
+a screen or needs a user to start pairing again.
+
+**Pairing:** both sides compute the code (§4.3), show it, and ask their user. Each side
+sends its decision once:
+
+```json
+{"type":"pair_decision","accept":true}
+```
+
+Pairing succeeds only if **both** sent `accept: true`; each side then stores the other in
+its trust list. A decline on either side ends pairing on both (the other prompt should
+close immediately). Timeout 60 s. After pairing, the connection becomes a normal
+connection.
+
+**Duplicate connections:** if both sides dial each other at once, keep the connection
+**opened by the device with the smaller id** (byte-wise comparison of the 32-byte ids)
+and close the other with reason `duplicate`.
+
+### 4.5 Streams after the handshake
+
+- **Unidirectional stream = one small message**, then finish. Types (`Message`):
+
+  ```json
+  {"type":"notify","title":"Ping","body":""}
+  {"type":"clipboard","text":"…"}             // ≤ 256 KiB of UTF-8, else ignored
+  {"type":"renamed","name":"Living Room PC"}    // sender's new name
+  {"type":"features","features":["files","notifications"]}  // sender's features now (§4.10)
+  {"type":"ping"}
+  {"type":"open_url","url":"https://…"}        // "Open on PC": open in the browser
+  {"type":"battery","level":82,"charging":false} // sender's battery, percent 0–100
+  {"type":"ring"}                               // ring loudly so the user finds you
+  {"type":"ring_stop"}
+  {"type":"clipboard_watch","on":true}          // send me your clipboard text as it changes
+  {"type":"picture","image":"<base64 JPEG or PNG, ≤ 128 KiB>"}  // the sender's own picture
+  {"type":"camera_state","session":"<uuid>","state":{…}}        // §4.8, phone → computer
+  // Phone notifications mirrored to the computer (phone → computer):
+  {"type":"notification_posted","key":"0|com.whatsapp|1|null|10123","app":"com.whatsapp",
+   "app_name":"WhatsApp","title":"Alice","body":"Lunch?","can_reply":true,
+   "actions":[{"id":"read","label":"Mark as read"}],"icon":"<base64 PNG, optional>",
+   "category":"msg","conversation":"Alice","sender":"Alice","group":false,     // these four,
+   "time":1762070400000,"picture":"<base64 PNG or JPEG>"}       // and these two: optional
+  {"type":"notification_removed","key":"…"}
+  // …and what the computer asks back (computer → phone):
+  {"type":"notification_reply","key":"…","text":"Sure!"}
+  {"type":"notification_action","key":"…","action":"read"}
+  {"type":"notification_dismiss","key":"…"}
+  // Media controls, both ways:
+  {"type":"media_watch","on":true}              // "send me your media_state while connected"
+  {"type":"media_state","seq":1760945000123,"players":[{"id":"spotify","app":"Spotify",
+   "title":"…","artist":"…","album":"…","playing":true,"position_ms":42000,
+   "length_ms":215000,"can_next":true,"can_previous":true,"can_seek":true,"art":"<base64>"}]}
+  {"type":"media_command","player":"spotify","command":{"action":"play_pause"}}
+  // actions: play, pause, play_pause, next, previous, seek (+ "position_ms")
+  // The computer's volume (desktop 0.9.8):
+  {"type":"volume_watch","on":true}             // "send me your volume_state while connected"
+  {"type":"volume_state","seq":1760945000123,"level":0.7,"muted":false}   // level: 0 to 1
+  {"type":"volume_set","level":0.4}             // and/or "muted":true; either alone is fine
+  {"type":"call_state","state":"ringing","contact":"Alice"}   // ringing | active | idle
+  {"type":"heartbeat_watch","on":true,"every_s":20}            // computer → phone
+  {"type":"heartbeat"}                                         // phone → computer, every every_s
+  // Texting from the computer: requests (computer → phone)…
+  {"type":"sms_list_threads","limit":50}
+  {"type":"sms_list_messages","thread":"7","before_ms":1760900000000,"limit":50}
+  {"type":"sms_send","client_id":"<uuid>","to":["+261340000000"],"text":"Sure!"}
+  // …answers and news (phone → computer):
+  {"type":"sms_threads","threads":[{"id":"7","addresses":["+261…"],"names":["Alice"],
+   "snippet":"Lunch?","date_ms":1760945000000,"unread":true}]}
+  {"type":"sms_messages","thread":"7","messages":[{"id":"312","from_me":false,
+   "address":"+261…","body":"Lunch?","date_ms":1760945000000}],"more":true}
+  {"type":"sms_message","thread":"7","message":{…}}        // new message, either way
+  {"type":"sms_sent","client_id":"<uuid>","ok":true}        // or "ok":false,"error":"…"
+  ```
+
+  Receiving any of these counts as activity on the connection. Unknown types are
+  ignored, so a newer device can send messages an older one doesn't know yet.
+
+  `open_url`: only `http://` and `https://` links, at most 8 KiB, no control characters;
+  receivers drop anything else (the core enforces this both ways). The desktop opens it
+  in the default browser at once and lists it in the activity timeline.
+
+  `battery`: the phone sends it right after connecting and whenever the level moves by
+  5 points or charging starts/stops (not more often: each send may open a connection).
+  The desktop shows it on the device while the phone is around, and notifies once at
+  15% or below when not charging. `ring`: play the alarm stream at full volume, even on
+  silent/DND, until `ring_stop`, a tap on a full-screen "Found it", or 30 s. `ring` and
+  `ring_stop` travel on separate streams and may arrive out of order; ignore a
+  `ring_stop` that comes before its `ring` within a second. A desktop that receives
+  `ring` shows an urgent notification with a sound ("find my laptop").
+
+  **Notifications.** `key` is the phone's stable id for the notification (Android:
+  `StatusBarNotification.getKey()`), 1–1024 bytes; posting the same key again updates it
+  in place. `icon` is a small PNG of the app's icon (96 px is plenty), base64, at most
+  64 KiB raw; send it every time or only the first time per app (the desktop caches it
+  per `app`). The desktop shows each one as a native notification with up to three
+  buttons: Reply (when `can_reply`), the first of `actions`, and "Mute <app>" (muting is
+  stored on the computer; the phone needn't know). What comes back:
+  - `notification_reply`: answer through the notification's `RemoteInput` action.
+  - `notification_action`: fire the action with that `id` (use the action's index or a
+    stable label as the id).
+  - `notification_dismiss`: the user clicked it or swiped it away on the computer: cancel
+    it on the phone (`NotificationListenerService.cancelNotification(key)`).
+  Send `notification_removed` when it goes away on the phone (read, swiped, answered), so
+  it goes away on the computer too. Nothing of it is saved to disk on either side.
+
+  **Messages (desktop 0.11.4).** The computer also makes the phone's conversations
+  out of these notifications, in memory only (100 conversations, the last 50 messages
+  each), for its Messages page: each new `body` from a chat, SMS, mail or social app is one
+  message; a verification code in it is copied to the clipboard (the user can turn that
+  off) and offered as "Copy 482913"; Reply answers through the notification while the
+  phone still has it. Phones that send only `title` and `body` work: they're read the way
+  WhatsApp, Messages, Gmail, Discord and others write them ("Bob @ Family", "Bob: hi",
+  "Carol (2 messages)"). A phone that knows more says so, every field optional:
+  - `category`: Android's `Notification.category` (`msg`, `email`, `social`…).
+  - `conversation`: the chat's name (`MessagingStyle.getConversationTitle()`, else the
+    other person's name in a one-to-one chat).
+  - `sender`: who wrote the newest message (its `Person` name); `group`: `true` for a
+    group chat (`MessagingStyle.isGroupConversation()`).
+  - `time`: when the newest message was sent, ms since 1970 (`Message.getTimestamp()`,
+    else `postTime`).
+  - `picture`: the sender's or the chat's picture (`Person.getIcon()`, else the large
+    icon), PNG or JPEG around 96 px, base64, at most 64 KiB raw; a bigger one is dropped.
+  With these, `body` is the newest message alone, not "Bob: …". Send the app's launcher
+  icon as `icon` (96 px), not the small status-bar one: the page shows it beside each
+  conversation.
+
+  **Inbox (desktop 0.12.1).** The Messages page became the device page's Inbox
+  tab: conversations plus the phone's other notifications (not messages: a reminder, a
+  delivery, a sign-in code), each with a dismiss button and Clear All
+  (`notification_dismiss`); a code in those is copied too. The computer keeps up to 200
+  messages per conversation. Optional, for a phone that can:
+  - `messages` on `notification_posted`: the conversation's latest messages, oldest first,
+    from `MessagingStyle.getMessages()` (and `getHistoricMessages()`), each
+    `{"sender":"Mum","text":"…","time":1730000000000,"mine":false}` (`mine` for the
+    user's own, without `sender`). The computer adds the ones it doesn't have; `body` is
+    still the newest alone. Up to 25.
+  - `subject` on `notification_posted` for mail (`EXTRA_TITLE_BIG` / the subject line),
+    with the mail's text in `body` (`EXTRA_BIG_TEXT`).
+  - `mine: true` on `notification_posted` when the newest message is the user's own
+    (its sender is `MessagingStyle.getUser()`, as after answering on the phone), and then
+    no `sender`; `conversation` stays the chat's name (in a one-to-one chat the other
+    person, never the user). Without it the computer guesses from names like "You" and
+    "Vous" and from the notification's `key`.
+  - **Answering after the notification is gone:** keep each conversation's newest reply
+    action (its `RemoteInput` and `PendingIntent`) when its notification goes away, and
+    say so: `{"type":"notification_removed","key":"…","reply_kept":true}`. The computer
+    keeps answering it with `notification_reply` and that `key`; the reply always goes out
+    the way the conversation came in (same app, same SIM or account: there's no choosing
+    another sender). Forget it, and answer `notification_reply` for it with nothing, once
+    the app cancels the intent or after a day.
+  - **Earlier messages:** with feature `inbox_history`, keep what the listener saw of each
+    conversation on the phone (per app and `conversation`, as sent; a few hundred messages,
+    the newest kept), and answer
+    `{"type":"inbox_history","app":"com.whatsapp","conversation":"Family","before_ms":1730000000000,"limit":50}`
+    with
+    `{"type":"inbox_history_page","app":"com.whatsapp","conversation":"Family","messages":[…],"more":true}`:
+    the messages older than `before_ms`, oldest first, at most `limit` (≤ 200), `more`
+    when there are older ones still. Android lets no app read another's messages, so
+    this is only what Linksy saw since its listener was turned on.
+
+  **Phone, for 0.11 (decided 2026-11-02):** a `NotificationListenerService` in the Linksy
+  app itself, not a separate app. Skip Linksy's own notifications and ongoing ones (music,
+  navigation, downloads); announce `notifications` in `features` while it's on
+  (`Node::set_features`, §4.10). On Android
+  13+ an app installed from the web finds the switch greyed out: ask once, then guide App
+  info › ⋮ › Allow restricted settings, then ask again. The listener makes Play Protect
+  block browser installs in many countries with no "Install anyway": the download page and
+  the update sheet should say to pause "Scan apps with Play Protect" while installing.
+  Messaging apps' notifications carry a `RemoteInput`, so this brings texts from WhatsApp,
+  Signal, Telegram and the SMS app with Reply, without any SMS permission.
+
+  **Media.** `media_state` is always the sender's *whole* set of players; a player missing
+  from it has stopped. `seq` is the time it was taken in ms since 1970: receivers keep the
+  newest and drop late, older ones (streams can arrive out of order). `art` is optional,
+  JPEG or PNG, at most 64 KiB raw.
+  - **Phone → computer:** send `media_state` whenever playback changes (play/pause,
+    track, every few seconds isn't needed: position is extrapolated) and after
+    connecting. The computer shows each player in GNOME's media controls as
+    "<app> on <phone>", and the keyboard's media keys work on it; buttons come back as
+    `media_command`.
+  - **Computer → phone:** send `media_watch {on: true}` while the phone shows the
+    computer's player (its media notification / page), `{on: false}` when it stops. The
+    computer then sends `media_state` on every change while the connection lives, and
+    acts on `media_command` for its players.
+  - **Position and seeking (desktop after 0.12.4).** `position_ms` is where the player was
+    when the state was taken: carry on from it while `playing`. Browsers often report no
+    position of their own (it sits at 0 while they play), so the computer counts it itself
+    for those, from the start of a track and from each seek, and it is right again after
+    any seek (a phone that opens a page in the middle of a track can see the count start
+    from 0 until then). `length_ms` is missing when the player doesn't know it (some
+    browser tracks): there is no timeline then. `seek` takes an **absolute** `position_ms`
+    and the computer goes exactly there; a new `media_state` follows.
+
+  **Volume (desktop 0.9.8).** The computer's system volume: its default sound output's
+  `level` (0 = silent, 1 = 100 %) and `muted`. Only computers that announce the `volume`
+  feature (§4.10) have it; the Flatpak doesn't.
+  - **Phone → computer:** send `volume_watch {on: true}` while the phone shows the
+    computer's player (its page or the media notification), `{on: false}` when it stops.
+    The computer answers with `volume_state` at once and again every time the volume
+    changes, whatever changed it (its keys, its own slider), within a second. Keep the
+    newest `seq`, as for `media_state`.
+  - **Changing it:** `volume_set` with `level`, `muted`, or both. A level past 1 is taken
+    as 1. Moving the slider doesn't unmute by itself: send `"muted":false` with the level
+    to unmute too, as phones do with their own volume. The new `volume_state` follows.
+  - **Phone UI:** a slider and a mute button under the computer's player. While that page
+    is in front, the phone's own volume buttons can step the computer's volume
+    (±5 %: `volume_set` with the last level ± 0.05) instead of the phone's.
+
+  **Calls.** Send `call_state` to paired computers that are around when a call starts
+  ringing, is answered, and ends (`idle`). The computer pauses whatever plays when it
+  rings and resumes exactly those players at `idle`; ringing also shows "Call from
+  <contact>" for 20 s. `contact` is optional: only send it if the user allowed contacts.
+
+  **Lock when you walk away.** A computer where the user turned it on for this phone sends
+  `heartbeat_watch {on: true, every_s}` (5–20 s) when the phone connects and when it's
+  switched on, `{on: false}` when switched off. While on, send `heartbeat` every
+  `every_s` seconds; a repeated watch replaces the schedule (don't start a second one).
+  The computer locks when no heartbeat came for its grace time (default 60 s), once, and
+  waits for a heartbeat before it can lock again. It never unlocks. This only works if
+  the heartbeats keep coming while the phone sits idle with its screen off: Android's
+  Doze stops background networking, so run them from a foreground service with its own
+  quiet notification ("Keeping fedora locked when you leave") while any computer
+  watches, or ask for the battery-optimization exemption. Heartbeats that stop while
+  the phone is on the desk would lock the computer for nothing.
+
+  **Texting.** The computer asks; the phone answers with the matching message, within
+  15 s (60 s for `sms_send`), or the computer says the phone didn't answer. Threads
+  newest first; messages newest first, at most `limit` (≤ 100), `more` when older ones
+  exist (the computer pages back with `before_ms` = the oldest date it has). `names`
+  follow `addresses` (empty when unknown or without contacts permission). After sending,
+  answer `sms_sent` and also push the sent message as `sms_message`; push every incoming
+  text as `sms_message` to computers that are connected (no need to dial for it: the
+  computer asks again when its Messages page opens). Nothing is stored on the computer.
+
+- **Bidirectional stream = one file transfer** (`TransferMsg`), opened by the sender:
+
+  1. Sender → `{"type":"offer","id":"<uuid>","files":[{"path":"Photos/a.jpg","size":123}]}`
+     Add `"import":true` for **photo auto-import**: the computer saves the files under
+     its Pictures folder, in `Pictures/<phone name>/<path>`, without asking, or answers
+     `decline` right away when it doesn't take imports (the user turned it off there).
+     Use paths like `2026-10/IMG_0001.jpg` so photos sort by month.
+     Add `"clipboard":true` to put **one file (≤ 10 MiB)** on the receiver's clipboard:
+     an image goes on as an image (pastes into chats and editors), anything else as a
+     file (pastes into the file manager). Taken without asking; more than one file or
+     a bigger one is declined. The receiver shows no download for it.
+     Add `"apps":[…]` to say that folders of the offer are apps (§4.22).
+     Paths are relative, `/`-separated. Folders are sent as their files, with the folder
+     name as the first component.
+  2. Receiver asks the user (or auto-accepts), then answers
+     `{"type":"accept","offsets":[0, 5242880, …]}` — one entry per file: how many bytes
+     it already has (resume) — or `{"type":"decline"}`. Unanswered after 120 s = decline.
+  3. For each file in order, the sender writes the **raw bytes from the offset to the
+     end** (not framed), then `{"type":"file_done","blake3":"<hex>"}` where the hash
+     covers the **whole file** (including the part the receiver already had).
+  4. After the last file the sender finishes its side of the stream. The receiver
+     answers `{"type":"complete"}` or `{"type":"failed","reason":"…"}`.
+
+  Receiver rules: write into `<name>.linksy-part`, rename to the final name only after
+  the hash matches; delete the part file on mismatch. Resume from an existing
+  `.linksy-part`. Never overwrite: pick `name (1).ext`, `name (2).ext`, …
+  **Reject unsafe paths:** empty, absolute, containing `..`, `.`, `\`, `:` or NUL.
+
+### 4.6 Presence and connection lifetime
+
+- Presence = discovery (§4.1). The UI shows a paired device as **Nearby** when it is
+  announced on the network, **Connected** while a link is open, **Not nearby** otherwise.
+- **Connect on demand:** sending anything dials the device at every known address in
+  parallel (announced addresses + last address that worked), 3 s per attempt. **Only the
+  QUIC/TLS handshakes race**: the first connection whose certificate matches the wanted
+  device gets the Linksy `hello`; the others are closed before any stream is opened.
+  (Running `hello` on several connections at once makes the receiver register
+  duplicates that close each other.)
+- **Idle close:** a connection with no transfer or prompt in progress and no message for
+  **60 s** is closed (QUIC close code 0, reason `idle`) — unless either side said
+  `stay_connected: true`. The next send dials again.
+- Listening costs nothing; incoming connections are always accepted, so a phone can be
+  reached while the app's service is running.
+
+### 4.7 QR-code pairing (invites) — `src/invite.rs`
+
+The desktop shows a QR code (menu → "Pair with QR Code…", or `linksy invite`). It
+encodes a link:
+
+```
+linksy://pair?v=1&id=<64 hex>&n=<name>&a=<ip:port>,<ip:port>&t=<token>
+```
+
+- Values are percent-encoded (RFC 3986 unreserved characters stay as is); `+` decodes
+  to a space. Unknown keys must be ignored. `v` must be `1`.
+- `a`: up to four addresses, best first (private IPv4 LAN, then other IPv4 such as VPNs,
+  then IPv6). IPv6 is in brackets: `[fd00::1]:47200`.
+- `t`: one-time token (32 hex chars). Valid **five minutes**, used up by the first
+  successful pairing, and cancelled when the dialog closes (the desktop shows a fresh
+  one every 4.5 minutes while open).
+
+The phone, after scanning:
+
+1. Races QUIC connections to the addresses (§4.6) and keeps the first one whose
+   **certificate fingerprint equals `id`**. Any other certificate: close, try the rest,
+   fail with "That's not the device in the QR code" if none matches.
+2. Sends `hello` with `"intent":"pair"` and **`"invite":"<token>"`**.
+3. After `welcome`, sends `{"type":"pair_decision","accept":true}` straight away (no code
+   shown; scanning is the user's consent) and reads the desktop's decision.
+
+The desktop, on a `hello` whose `invite` matches its current token, also skips the
+prompt and answers `accept: true`. If the token is wrong, reused or expired it falls back
+to the normal flow: it shows the 6-digit code and asks its user. The phone should then
+show the code too (§4.3) — so a phone must still support the code flow.
+
+Security: the phone authenticates the desktop by the pinned `id`; the desktop
+authenticates the phone by the token, which only someone who saw the screen has.
+
+### 4.8 Media sessions (screen mirroring) — `src/protocol.rs`, `src/node.rs`
+
+A media session is a **bidirectional stream** whose first frame is a session request
+(file offers are the other kind of bidirectional stream; dispatch on the first frame's
+`type`). The device that wants to **watch** opens it:
+
+```json
+{"type":"session_request","id":"<uuid>","kind":"screen"}
+```
+
+The receiving device **asks its user** ("Pixel 9 wants to see your screen", Allow /
+Always Allow / Don't Allow; auto-accept for files never applies) and answers within 120 s.
+**Always Allow** is only offered for `screen`, `control` and `input`: it marks the
+requesting device (core: `node.set_allow_screen(id, on)`, `DeviceView.allow_screen`, a
+switch **Always Allow Screen and Control** on its page), and from then on those three
+start without asking, on the same network or cable. From away they're always asked
+(and only after Allow Everything From Away, §4.13). The camera, the microphone, a second
+display and terminals are always asked. A session that started without asking is still
+announced when it starts ([desktop#49](https://github.com/LinkSy-mg/linksy-desktop/issues/49)).
+
+**Choosing the screen again.** A computer remembers which screen its user picked in the
+desktop's dialog, per kind, and never shows the dialog again. To show another monitor, the
+viewer adds `"choose": true` to a `screen` or `control` request; the computer then shows
+the dialog again, its user picks, and that pick is remembered instead. It's ignored for
+other kinds, and absent means false (older computers ignore it and show the remembered
+screen). Core: `node.request_session_choosing(to, kind)`; the sharing side reads
+`Session.choose`. The phone offers it as **Choose Screen** on a computer's screen viewer:
+end the running session, then request again with `choose`. Someone has to be at the
+computer to pick ([desktop#15](https://github.com/LinkSy-mg/linksy-desktop/issues/15)).
+
+```json
+{"type":"session_request","id":"<uuid>","kind":"control","choose":true}
+```
+
+```json
+{"type":"session_accept"}
+{"type":"session_decline"}                          // the user said no
+{"type":"session_decline","reason":"unsupported"}  // this device can't do that kind
+```
+
+A device that **can't** do a kind (a phone asked to be controlled before that's built)
+must answer with `reason: "unsupported"`, through core `node.decline_unsupported(request)`
+instead of `node.respond(request, false)`. The desktop then says "realme can't be
+controlled yet" instead of "didn't allow it", and a refused control request keeps the
+screen view running. Unknown `reason` values read as a plain decline.
+
+After `session_accept`:
+
+- **Sharer → viewer:** raw **H.264 Annex-B byte stream** (no framing): start codes,
+  SPS/PPS repeated before every keyframe (`config-interval=-1`), access-unit aligned.
+  **Profile: Constrained Baseline** (every decoder handles it, including OpenH264 and
+  phone hardware). Desktop sends ~8 Mbit/s, keyframe at least every 2 s (60 frames),
+  up to 30 fps, at the screen's resolution. While the screen is still, the
+  last frame comes again every 100 ms, so the newest change never waits in an encoder.
+- **Viewer → sharer:** framed JSON control messages (u32 BE length + JSON). A sharer must
+  keep reading this half and ignore unknown types. In `screen` sessions the viewer sends
+  nothing; in **`control`** sessions (same media, plus input; the prompt says "wants to
+  control your screen") it sends input:
+
+  ```json
+  {"type":"pointer","x":0.42,"y":0.13}                  // fraction of the shared screen, 0–1
+  {"type":"button","button":"left","pressed":true}     // left|middle|right|back|forward
+  {"type":"scroll","dx":0,"dy":2,"discrete":true}     // wheel steps; false = pixels
+  {"type":"key","keysym":65307,"pressed":true}         // X11 keysym (Escape here)
+  ```
+
+  On Android, a phone viewer controlling a desktop maps taps to `pointer` + `button`
+  left, two-finger drags to smooth `scroll`, and the soft keyboard's characters to
+  keysyms (`U+0020–U+007E` are the keysym; others are `0x01000000 + codepoint`).
+  A phone sharing its screen can't accept desktop input without an accessibility
+  service; leave `control` unsupported there (decline the request).
+
+- **`display` (Sidecar): roles reversed.** The device that *sends* `session_request` with
+  `"kind":"display"` is the one that shares: it creates a new virtual monitor (desktop:
+  1920×1080) and streams it; the receiver, after its user allows ("X wants to use this
+  screen as a second display"), shows it **full screen** and sends `pointer` / `button` /
+  `scroll` / `key` input back, exactly as in `control`. This is how an Android tablet or
+  phone becomes a desktop's second screen: accept the request, go immersive full screen,
+  decode, and map touches to `pointer` + `button` left (two-finger drag → `scroll`).
+  Core reports `sharing: true` on the requester and `false` on the display.
+- Either side ends the session by finishing/resetting its half or closing the stream.
+  A connection with a session open is never closed as idle.
+
+On Android:
+- **Watching** a desktop: decode with `MediaCodec` (`video/avc`) into a `SurfaceView`;
+  split on start codes or feed via an Annex-B parser.
+- **Sharing** the phone's screen with a desktop: `MediaProjection` (the system asks the
+  user) → `MediaCodec` encoder, `KEY_PROFILE = AVCProfileConstrainedBaseline`,
+  `KEY_I_FRAME_INTERVAL = 2`, prepend SPS/PPS (`csd-0`/`csd-1`) to every keyframe, write
+  Annex-B to the stream. The desktop app then shows it in its viewer window.
+- **`camera` (phone as webcam):** the desktop sends `session_request` with
+  `"kind":"camera"`; the phone asks its user ("Studio wants to use your camera"), then
+  streams its camera exactly like a screen: H.264 **Constrained Baseline**, Annex-B,
+  **1280×720 at 30 fps**, keyframe every 2 s, SPS/PPS before each keyframe. The desktop
+  decodes it and offers it to every app as a PipeWire camera named
+  "Linksy Camera (<phone name>)". On Android: CameraX `Preview`/`ImageAnalysis` or
+  Camera2 into a `MediaCodec` input surface; keep it running in a foreground service with
+  the camera type while the session lasts; offer front/back switch and keep the phone's
+  screen dimmed. Nothing comes back on the viewer's half.
+- Core API: `node.request_session(id, SessionKind::Screen | Control | Display | Camera) -> Session` (read
+  `session.recv`), and `node.incoming_sessions()` → accepted `Session`s to feed
+  (`session.send`). Events: `session_request {request, from, kind}`,
+  `session_started {session, peer, kind, sharing}`, `session_ended {session}`.
+
+
+**Keep the screen on while it's a display (desktop 0.5.8; seen on a realme 15 Pro).** The
+phone's screen timeout turned its screen off a minute into a second display, which ended
+the session and took the monitor away. While showing a `display` (and while watching a
+`screen`/`control`), keep the screen on: `window.addFlags(FLAG_KEEP_SCREEN_ON)` on that
+activity (Flutter: a wakelock package, or the flag through a platform channel), cleared
+when the session ends. Also don't end the session in `onPause`/`onStop` just because the
+user switched apps for a moment; end it on Stop or when the computer ends it. If the
+session does drop, the computer now offers "Reconnect" (a new `display` request: answer
+it like the first). For `camera` and `microphone` the phone's screen may go off, but
+their foreground services must keep running.
+
+**Second display in the phone's shape (desktop 0.5.5).** Accepting a `display`, the phone
+may add its landscape screen size: `{"type":"session_accept","width":2400,"height":1080}`
+(core: `node.respond_session(request, true, Some((w, h)))`). The computer then makes the
+virtual monitor in that shape, at most 1080 px high (2800×1272 → 2376×1080). Without it,
+1920×1080 as before. On KDE the desktop keeps its own size (1920×1080, or the resolution
+picked in KDE's sharing dialog) since desktop 0.9.6: read the size from the stream's SPS,
+fit it to the screen with black bars, and send `pointer` positions relative to the video,
+not the whole screen.
+
+**`input` sessions (desktop 0.4.1): the phone as touchpad, keyboard and presentation
+remote.** The *phone* requests `{"type":"session_request","id":…,"kind":"input"}`; the
+computer asks its user, then answers `session_accept`. No media flows: the phone writes
+framed `ControlMsg`s on its send side, as a `control` viewer does, until it finishes the
+stream. Two messages exist for this:
+
+```json
+{"type":"pointer_by","dx":12.5,"dy":-3.0}   // move by pixels (touchpad)
+{"type":"text","text":"hello"}              // type text (keyboard field, IME)
+```
+
+plus the usual `button`, `scroll` (two fingers) and `key` (X11 keysyms: Right 0xff53 /
+Left 0xff51 or Page_Down 0xff56 / Page_Up 0xff55 for slides, Return 0xff0d, BackSpace
+0xff08, Escape 0xff1b). Absolute `pointer` messages are ignored (there's no screen).
+The computer shows "<phone> is your touchpad and keyboard" with Stop.
+
+**Camera controls from the computer (desktop 0.5.7, `docs/android-app.md` §2.8).** While a
+`camera` session runs, the computer writes `camera_control` frames on its send side
+(u32 BE length + JSON), exactly the keys the phone already reads. The phone sends what it
+can do and how it's set as a **connection message** (§4.5), at the start and after every
+change, whoever made it:
+
+```json
+{"type":"camera_state","session":"<session uuid>","state":{…the object in docs/android-app.md §2.8…}}
+```
+
+Core: `node.send_camera_state(computer_id, session.id, state_json)`;
+`Event::CameraState { from, session, state }` on the computer. The computer shows the
+controls under its camera preview: front/back (when both `lenses` exist), the
+`zoom_presets` as chips, torch (`has_torch`), click on the preview → `focus_point`
+(+ `"focus":"point"`, and an Auto Focus button when the focus isn't `auto`), and in a
+menu `exposure`, `white_balance`, `quality`, `orientation`, `stabilization`
+(`has_stabilization`), and **60 fps** (when `fps_options` has 60). It redraws from every
+`camera_state`, so the phone's own controls and the computer's stay in step.
+
+**60 fps (desktop 0.5.9, `docs/android-app.md` §2.8).** The computer's webcam device advertises
+the rate the phone sends. When `fps` changes, whether the computer sent
+`{"type":"camera_control","fps":60}` or the phone's own control did it (seen in
+`camera_state.fps`), the computer restarts its webcam at the new rate within the same
+session, and decoding resumes at the phone's next keyframe with SPS/PPS (which the phone
+already sends after the change). Apps using the camera see it blink once. So the phone
+must keep reporting `fps` in every `camera_state`.
+
+**1080p (desktop 0.6.0, `docs/android-app.md` §2.8 "later").** Same mechanism for the size: the
+computer sends `{"type":"camera_control","size":[1920,1080]}` (or `[1280,720]` back),
+and follows `width`/`height` from `camera_state`, restarting its webcam device at that
+size within the session. Only 1280×720 and 1920×1080. **Phone to-do:** list what the
+camera can stream in `camera_state` as `"size_options":[[1280,720],[1920,1080]]` (the
+computer shows its "1080p" switch only then), restart the encoder at the new size on
+`size` (SPS/PPS and a keyframe after, as for `fps`), report the new `width`/`height`,
+and raise the bitrate (about 1.5× at the same `quality`).
+
+**Webcam latency (desktop 0.5.7).** The computer now decodes with slice threading
+instead of libav's frame threading, which held one frame per CPU thread: about 400 ms
+less on a 12-thread laptop (measured: 404 ms → 37 ms from receiving a frame to
+showing it). On the phone, to keep its part small:
+- `MediaFormat.KEY_LATENCY = 1` (API 30+) and `KEY_LOW_LATENCY = 1` where the codec has
+  it (`FEATURE_LowLatency`); `KEY_PRIORITY = 0` (realtime); no B-frames
+  (Constrained Baseline already has none); `KEY_MAX_B_FRAMES = 0` to be sure.
+- Write each encoded buffer to the stream as soon as `dequeueOutputBuffer` returns it;
+  don't batch. An `AUD` (`00 00 00 01 09 f0`) before each access unit lets the computer
+  end a frame without waiting for the next one's start code (about one frame, 33 ms).
+- Keep `KEY_REPEAT_PREVIOUS_FRAME_AFTER` short (e.g. 100 ms) so a still picture keeps
+  flowing.
+- Over USB (§4.11) Wi-Fi's jitter goes away too.
+
+**`microphone` sessions (desktop 0.5.7): the phone as the computer's microphone.** The
+computer sends `{"type":"session_request","id":…,"kind":"microphone"}`; the phone asks
+its user ("Studio Laptop wants to use your microphone"), then writes **raw PCM**: 16-bit
+signed little-endian, **48 000 Hz, mono**, no header, no framing, in small chunks (10 ms
+= 960 bytes; don't buffer more than 20 ms). About 100 KB/s. Nothing comes back. The
+computer offers it to every app as a microphone, "Linksy Microphone (<phone name>)", and
+drops audio that arrives more than 100 ms late rather than letting delay pile up. On
+Android: `AudioRecord` with `MediaRecorder.AudioSource.VOICE_COMMUNICATION` (echo
+cancellation and noise suppression on most phones) or `MIC`, `ENCODING_PCM_16BIT`,
+`CHANNEL_IN_MONO`, 48 kHz (resample if the device refuses), in a foreground service of
+type `microphone` (`FOREGROUND_SERVICE_MICROPHONE`, plus `RECORD_AUDIO` at run time; both
+fine for a sideloaded app). Announce `microphone` in `features` (§4.10); until then the
+computer doesn't offer it for Android phones. Core: `SessionKind::Microphone`; the phone
+writes to `session.send`. Desktop to desktop works too (`linksy mic <device>`).
+
+### 4.9 Browsing files ("phone in the Files sidebar") — `src/fs.rs`
+
+A computer browses the phone's files with one request per **bidirectional stream**. The
+first frame is the request, tagged `"type":"fs"` and an `op`:
+
+```json
+{"type":"fs","op":"list","path":"/DCIM"}
+{"type":"fs","op":"stat","path":"/DCIM/IMG_1.jpg"}
+{"type":"fs","op":"read","path":"/DCIM/IMG_1.jpg","offset":0,"length":1048576}
+{"type":"fs","op":"write","path":"/Download/a.pdf","offset":0,"length":1048576,"truncate":true}
+// …followed by exactly `length` raw bytes
+{"type":"fs","op":"mkdir","path":"/Download/New"}
+{"type":"fs","op":"delete","path":"/Download/New"}        // folders with their contents
+{"type":"fs","op":"rename","path":"/a.txt","to":"/b.txt"}
+{"type":"fs","op":"info"}                                  // optional → {"type":"fs_info","name":"Documents"}
+```
+
+The phone answers one frame (then, for `fs_data`, exactly that many raw bytes) and
+finishes the stream:
+
+```json
+{"type":"fs_entries","entries":[{"name":"DCIM","dir":true,"size":0,"modified_ms":0}]}
+{"type":"fs_entry","entry":{"name":"IMG_1.jpg","dir":false,"size":2400000,"modified_ms":1760945000000}}
+{"type":"fs_data","length":1048576}
+{"type":"fs_ok"}
+{"type":"fs_error","message":"Permission denied","not_found":false}
+```
+
+Paths are absolute within what the phone shares, `/` its root (shared storage,
+`/storage/emulated/0`). Reads and writes are at most 4 MiB; the computer uses 1 MiB.
+`stat "/"` must answer a folder. A phone that doesn't call `node.incoming_fs()` answers
+"this device doesn't share its files" automatically, and the computer tells the user to
+turn sharing on in the phone app. In Rust: `node.incoming_fs()` gives `FsCall`s; answer
+each with `entries` / `entry` / `data` / `ok` / `error`, and read a write's bytes with
+`body()` first.
+
+**Files tab (desktop 0.12.1).** The device page's Files tab copies to and from the
+phone, makes folders, renames and deletes with these same ops; nothing new on the wire.
+A copy keeps up to 4 `read`s in flight and several copies can run at once, so answer each
+stream on its own task rather than one after another. The computer never overwrites: it
+lists the folder first and picks `name (1).ext`, comparing names without case as Android
+storage does. Answer `fs_error` for a path outside the shared folder (`..`) and for
+deleting `/` itself.
+
+
+### 4.10 Features: what each device can do (`DeviceInfo.features`)
+
+`DeviceInfo` has an optional `features` list (in `hello`/`welcome`), so the other side can
+hide what a device can't do. Names: `files`, `clipboard`, `open_url`, `battery`, `ring`,
+`media_remote` (controls the other's players), `media_state` (shares its own players),
+`volume` (shares its system volume and takes `volume_set`),
+`call_state`, `heartbeat`, `import`, `fs`, `input`, `screen`, `control` (can be
+controlled), `display`, `camera`, `watch`, `notifications` (mirrors its notifications),
+`sms`, `clipboard_file` (takes `"clipboard":true` offers), `clipboard_watch` (answers
+`clipboard_watch`), `microphone` (shares its microphone), `picture` (sends and shows
+`picture`), `direct_host` (hosts direct links: a phone with Wi-Fi Direct, §4.17),
+`direct_join` (joins them: a computer whose NetworkManager has a Wi-Fi Direct device, or a
+phone), `direct_group` (hosts and joins Wi-Fi Direct groups by name and passphrase: phones,
+§4.17 "Phone to phone"), `inbox_history` (answers `inbox_history`, §4.5), `gallery` (shows
+its photos, §4.18), `deck` (a computer that runs a phone's deck, §4.19), `deck_layout` (a
+phone that draws the deck layouts a computer sends, §4.20), `turn_on` (a phone that asks its
+user when a computer asks it to turn something on, §4.21), `preflight` (answers the check
+before a send, §4.22; computers announce it too), `apps` (sends and installs apps, §4.22).
+Set `Config.features` in the core. To change them while running (`notifications` turned
+on or off), call `Node::set_features`: connected devices get a `features` message
+(at most 64 names of up to 64 bytes) and update at once, others see the new list at the
+next handshake. Older desktops ignore the message until they reconnect.
+A desktop announces all of them,
+except `clipboard_watch` where its desktop doesn't let apps watch the clipboard (GNOME).
+When a device sends no list (older versions), the desktop assumes everything except, for
+`os == "android"`, `sms`, `notifications`, `media_state`, `control`, `clipboard_file`,
+`clipboard_watch` and `microphone`.
+
+### 4.11 USB cable (desktop 0.5.7)
+
+Lower latency and no Wi-Fi needed, for the webcam and microphone above all, with **no
+developer options**: the computer uses **Android Open Accessory (AOA 1.0)**.
+
+1. When an Android phone is plugged in (and an Android phone is paired), the computer
+   asks once per phone ("Pixel 9 is plugged in. Use it with Linksy over the cable?").
+   On yes it sends AOA's control requests (51 get protocol, 52 strings, 53 start) with
+   **manufacturer `Linksy`, model `Linksy`**, description "Linksy over USB", version
+   `1` (the framing below), URI `https://linksy.diary.mg`. The phone re-enumerates as an
+   accessory (Google's 18d1:2d00–2d05).
+2. **Phone app:** declare the accessory in the manifest
+   (`<uses-feature android:name="android.hardware.usb.accessory"/>`, an activity with
+   the `USB_ACCESSORY_ATTACHED` intent filter and `res/xml/accessory_filter.xml`:
+   `<usb-accessory manufacturer="Linksy" model="Linksy"/>`). Android then offers to
+   open Linksy; "always" makes it automatic. Open it with
+   `UsbManager.openAccessory(accessory)` → a `ParcelFileDescriptor` with an input and an
+   output stream.
+3. **What crosses the cable: Linksy's own QUIC packets**, unchanged and still encrypted
+   end to end, each as a **2-byte big-endian length + the UDP payload**. On the phone, a
+   tiny bridge: bind a UDP socket on `127.0.0.1:0` (port P); for each datagram the
+   phone's node sends to it, write `len + bytes` to the accessory; for each `len + bytes`
+   read from the accessory, send the bytes back to the node's address (learned from the
+   first datagram). Batch several frames in one write when they're waiting.
+4. **Then dial the computer through it:** `node.connect(127.0.0.1:P)` (the core's normal
+   reconnect, to a known paired device). The handshake checks the computer's pinned key
+   as always. On the computer the packets arrive from `127.0.0.1`, which is how both
+   sides know this connection is the cable: **a USB connection replaces a Wi-Fi one** to
+   the same device (both cores agree without talking: the one over loopback wins), and
+   its address is never saved as the device's address. `DeviceView.usb` is true for it;
+   the computer shows "Connected by USB".
+5. Unplugging ends the accessory streams → the connection drops → the normal Wi-Fi
+   reconnect takes over. Start sessions after plugging in: a running session doesn't
+   move to the cable. Since desktop 0.12.1 the computer closes the connection that came
+   through the cable the moment the cable link ends, instead of waiting out QUIC's 30 s.
+   The phone should do the same: when its accessory goes away (`ACTION_USB_ACCESSORY_DETACHED`,
+   or a read on it failing), close the QUIC connection through its bridge, stop showing
+   "Connecting over USB" and dial the computer over Wi-Fi at once (linksy-mobile#20).
+
+Linux needs permission to switch the phone and to use it as an accessory: the .deb and
+.rpm install a udev rule (`70-linksy-usb.rules`); Finish Setup adds it otherwise (not
+possible from the Flatpak).
+
+**Desktop 0.8.0: Connect by USB Cable.** The computer's app has a guide (a phone's page,
+"Faster by USB Cable"; or the main menu) that follows each step live and switches the
+phone itself with a Connect button, so the notification is no longer the only way in.
+It also switches a phone that **isn't paired yet**. Phone side, please:
+
+- [ ] When the accessory opens and no paired computer answers through it within a few
+      seconds, **offer to pair over the cable**: `node.pair(127.0.0.1:P)` through the same
+      bridge (both screens show the code as on Wi-Fi). The computer accepts pairing
+      requests that arrive over the cable like any other.
+- [ ] **BLOCKER, found on a realme 15 Pro 5G with phone 0.2.1 + desktop 0.8.0
+      (2026-10-22): the phone app never takes the cable.** The computer switches the
+      phone fine (it re-enumerates as `18d1:2d00`, "Android Open Accessory device"), the
+      computer's bridge opens and waits, but **0 packets ever arrive from the phone** (and
+      so 0 go to it: the phone's node never dials). About 17 s later Android drops out of
+      accessory mode (no app claimed it) and the phone comes back as a normal USB device.
+      The user saw **no "open with Linksy" prompt at all** on the phone, in "Transfert de
+      fichiers" mode, phone unlocked, Linksy installed. To check on the phone (logcat with
+      USB debugging on gives `2d01` instead of `2d00`; or wireless debugging):
+      1. Is `USB_ACCESSORY_ATTACHED` delivered to `MainActivity` at all? realme/ColorOS
+         may not show the chooser; then `UsbManager.accessoryList` still lists it:
+         **poll for it** (when the app is in front, on resume, and from a
+         `BroadcastReceiver` for `UsbManager.ACTION_USB_ACCESSORY_ATTACHED` registered at
+         runtime) and ask permission with `UsbManager.requestPermission(accessory, pi)`
+         when `hasPermission` is false, instead of returning null as `UsbBridge.open`
+         does now.
+      2. `openUsb` runs from `onCreate` before Flutter's channel exists: the
+         `invokeMethod("usbPort")` is lost, and the controller only asks `usbPort()` at
+         start. Make sure a bridge opened later still reaches `_onUsb` (and log
+         "usb cable: bridge on 127.0.0.1:P" / the dial result).
+      3. `_onUsb` swallows errors (`catchError((_) {})`): log them.
+      Desktop side to compare with: `journalctl --user -u linksyd | grep "USB link"` shows
+      "USB link: N packets from the phone, M to it" when each cable session ends.
+      Desktop 0.8.1 no longer re-switches a phone whose app didn't answer (it looped);
+      the guide says "Linksy on the phone didn't take the cable" with Try Again.
+- [ ] The "open with" prompt is the step people get stuck on: when the accessory opens,
+      bring Linksy to the front with a clear "Connected by USB cable" state, and say on
+      the device page that the cable is in use. Try the bridge without a phone: `cargo test -p linksyd usb`
+runs QUIC through an in-memory cable between two nodes.
+
+**Desktop 0.9: the cable when you ask for it** ([desktop#36](https://github.com/LinkSy-mg/linksy-desktop/issues/36),
+[mobile#11](https://github.com/LinkSy-mg/linksy-mobile/issues/11)). Plugging a phone in no
+longer asks anything: most of the time it's only charging, and switching stops its normal
+USB file transfer. The cable is used when someone presses **Connect by USB Cable**, on the
+computer or on the phone.
+
+- **The computer tells connected Android phones what's plugged into it**, whenever that
+  changes and once after connecting (computer → phone, unidirectional):
+
+  ```json
+  {"type":"usb_plugged","phones":[{"key":"<USB serial or vendor:product>",
+    "manufacturer":"Google","product":"Pixel 9","state":"plugged"}]}
+  ```
+
+  `manufacturer` and `product` are the USB descriptor strings; `state` is `plugged`,
+  `switching`, `accessory` or `failed` (as in the computer's `usb_status`). An empty list
+  when nothing is plugged.
+- **Phone: show "Connect by USB Cable"** on that computer's page while the phone is
+  plugged into a USB host (it's charging over USB, or `UsbManager`'s
+  `ACTION_USB_STATE` says connected) **and** the computer lists a phone in state
+  `plugged` or `failed` whose `manufacturer`/`product` match `Build.MANUFACTURER` /
+  `Build.MODEL` (case-insensitive; the product string often equals the model). If none
+  matches but the computer lists exactly one such phone, show it too. Pressing it sends
+  (phone → computer):
+
+  ```json
+  {"type":"usb_connect","key":"<that phone's key>"}
+  ```
+
+  The computer switches that phone (as its own button does) and its next `usb_plugged`
+  says `switching`, then `accessory`. From there it's the accessory flow above: open
+  Linksy on the phone if Android asks, the bridge, `connect(127.0.0.1:P)`.
+- **Computer:** no notification on plug-in. A device page for a paired Android phone shows
+  **Connect by USB Cable** while a phone is plugged in and not switched; with exactly one
+  plugged phone it switches it, with several it opens the guide to pick one.
+- **Use the cable automatically:** a switch per plugged-in phone in the computer's Connect
+  by USB Cable guide, **off by default** (also for phones that said yes before). On, that
+  phone is switched as soon as it's plugged in, as before. The setting lives on the
+  computer (`usb-auto.json`, keyed by the phone's USB serial); the phone needs nothing.
+- **Shipped in desktop 0.8.7:** no question on plug-in, Connect from the guide (the phone's
+  page leads there), and the automatic switch. **Desktop 0.9:** `usb_plugged` (sent to
+  connected Android phones when the list changes and when they connect) and `usb_connect`
+  (switches that phone). Core: `Node::usb_plugged`, `Node::usb_connect`, `Event::UsbPlugged`,
+  `Event::UsbConnect`. The phone's button is still to do.
+
+**Desktop 0.11: Linksy Cable (framing version 2), and why the cable stayed silent.**
+Android's own source explains the realme and Samsung A05 failures (releases#8): the phone
+side never handed the accessory over. Accessory mode stays: Android Auto's wired mode runs
+on it, so every phone has it, and it needs no developer options. What changes:
+
+- **Framing version 2** (`linksy_core::cable`, shared by both ends). Data frames are as
+  before (2-byte length + QUIC packet). Control frames start with a zero length, then a
+  kind byte and a 2-byte length: `1` hello (`[version]`), `2` ping and `3` pong (an 8-byte
+  stamp), `4` close, `5` pad (nothing). The computer announces version `2` in the
+  accessory's version string (`UsbAccessory.getVersion()`); the phone sends a hello only
+  then, and the computer sends control frames only after the phone's hello, so version 1
+  on either side keeps working. The computer pings every second; a side that hears
+  nothing for 5 s lets go.
+- **Phone, please: use `linksy_core::cable::phone_bridge`** instead of `UsbBridge.kt`'s
+  streams. Kotlin keeps Android's part: the `USB_ACCESSORY_ATTACHED` activity (it's only
+  ever delivered to an activity), `hasPermission`/`requestPermission`, `openAccessory`.
+  Then `pfd.detachFd()` goes to Rust (`File::from_raw_fd`), with `accessory.version`;
+  `phone_bridge` returns the port to dial (`node.connect(127.0.0.1:P)`). It reads 16 KB at
+  a time: Android gives each read one USB request, and **a smaller read drops the rest of
+  that request** (`DataInputStream.readUnsignedShort()` over the accessory does exactly
+  that). It also pads writes that would end on a full USB packet and answers keepalives.
+- [ ] **Phone: why the realme never got the accessory.** Android leaves accessory mode if
+      the link isn't configured within **10 s** of the switch, and on some builds waits for
+      the first unlock after boot; the realme came back after about 17 s with no prompt,
+      which fits. Check on a test phone with `logcat -s UsbDeviceManager` ("entering USB
+      accessory mode", "exited USB accessory mode") and `dumpsys usb`. The computer now
+      switches again (3 tries) when a phone comes back as it was, then says to unlock it.
+- [ ] **Phone: the Samsung A05 showed "the computer will show a pairing code"** over the
+      cable while already paired over Wi-Fi: the cable should dial the paired computer
+      first and offer pairing only when nobody answers (above).
+- **Computer side:** each batch to the phone ends on a short or empty USB packet
+  (`submit_end`), endpoints aren't reset on open (that breaks bulk transfers on some
+  Samsungs), and phones in charging-only mode are recognised by maker too (udev rule
+  version 2).
+
+**Desktop 0.11: controlling a phone over the cable, no developer options.** Android Open
+Accessory 2.0 lets the computer plug a **virtual touchscreen and keyboard** into the phone
+over USB (requests 54–57, ids 1 and 2), as scrcpy's OTG mode does. It works in accessory
+mode or not, and needs nothing from the app: the phone's kernel makes the input devices.
+When someone takes control of a phone's screen on the computer, the computer asks the
+phone for a plain `screen` session and drives it through those devices; it never sends
+`control`. Taps land where clicked (a multitouch digitizer, 0–32767 in the display's
+natural orientation), the wheel is a short drag, Escape (and the right button) is Back,
+keys are sent by position (`ControlMsg::Key.code`), so the phone types with its own
+layout, and text goes through `clipboard` then Ctrl+V. Scrolling is one finger dragging
+(down when scrolling starts, lifted when it stops). With no input for 10 s the computer taps
+Shift, which keeps the phone's screen on and types nothing. A phone that can be driven
+opens in control on the computer, unless the person turned it off for that phone. Works
+on a realme 15 Pro. Switching into accessory mode removes the devices; the computer adds
+them once the phone is back. Phone side, please:
+
+- [ ] While a computer drives the phone (a `screen` session to it, and an input device
+      named for the accessory appears in `InputManager`), show a lasting "Controlled from
+      <computer>" notification with Stop.
+- [ ] Rotation: the touchscreen uses the natural orientation; in landscape the computer
+      would need the rotation. Send it with the screen (to be specified) or keep control
+      to portrait for now.
+- [ ] **Without the cable:** an accessibility service (`dispatchGesture` for taps and
+      swipes, global actions for Back/Home/Recents, `ACTION_SET_TEXT` for typing) gives
+      the same control over any link. Sideloaded installs need "Allow restricted settings"
+      in Linksy's App info once, then Accessibility, Linksy, On. Announce `control` in
+      `features` when it's on, and take `control` sessions as computers do.
+
+### 4.12 Service information (planned for 0.6)
+
+`https://linksy.diary.mg/linksy-relay` is a small JSON file the apps read: **information
+only**, never something to execute. It's rebuilt with the website, so editing it needs
+no app release (in linksy-site: `src/data/service.ts`).
+
+```json
+{
+  "schema": 1,
+  "generated": "2026-10-21T11:40:54Z",
+  "service": { "name": "Linksy", "website": "…", "privacy": "…", "issues": "…", "releases": "…" },
+  "relays": [ { "url": "https://linksy-relay.diary.mg", "health": "https://linksy-relay.diary.mg/ping" } ],
+  "protocol": { "current": 1, "minimum": 1 },
+  "latest": {
+    "linux": { "version": "0.5.7", "notes": "…", "downloads": { "flatpak": "…", "deb": "…", "rpm": "…", "tarball": "…" } },
+    "android": { "download": "…/linksy.apk" }
+  },
+  "notices": [ { "id": "…", "level": "info|warning", "title": "…", "body": "…", "platforms": ["android"], "until": "ISO 8601" } ],
+  "stats": { "downloads": { "linux": 2, "android": 15, "total": 17 }, "devices_online": 0, "updated": "…" }
+}
+```
+
+How the apps use it:
+- **When:** at start-up and at most once a day, over HTTPS, with a 5 s timeout. Cache the
+  last good copy; offline or on any error, use the cache, then the defaults built into
+  the core (the relay `https://linksy-relay.diary.mg`). Never block anything on it.
+- **`relays`:** away-from-home access (0.6) uses the first relay whose `url` is `https`;
+  the others are fallbacks. A device's own relay is what it tells its peers. A relay set
+  in Preferences (self-hosting) always wins.
+- **`latest`:** "Linksy X is available" when newer than this app, with a link to `notes`
+  or the download. Never downloads or installs anything by itself.
+- **`protocol.minimum`:** above this app's protocol version, say "Update Linksy to keep
+  connecting"; otherwise ignore.
+- **`notices`:** show each once (remember `id`), as plain text (no markup, no links
+  made clickable beyond https), only for listed `platforms`, not after `until`.
+- **`stats`:** totals for display only (an About page, say): downloads from GitHub and
+  devices connected through the relay right now. Either may be `null`. There is no user
+  count: Linksy has no accounts and sends nothing about its users anywhere.
+- **Robustness:** ignore unknown fields; skip the whole file if `schema` isn't 1, if it
+  isn't valid JSON, or if it's over 64 KiB. What it says can't reach anyone's data: a
+  wrong relay can only fail to connect (everything is end-to-end encrypted with keys
+  pinned at pairing).
+
+### 4.13 Away from home (desktop 0.6.0)
+
+Paired devices reach each other over the internet, through **iroh** (`iroh` 1.4, already
+in `linksy-core`): a direct path when the networks allow it, else through Linksy's relay
+`https://linksy-relay.diary.mg` (§4.12 lists it; `linksy-server`). Everything stays
+Linksy's own QUIC, encrypted end to end with the keys pinned at pairing: iroh only
+carries its packets, like the USB cable (§4.11).
+
+- **In the core, nearly all done.** Set `Config.away = true` and `Config.relay =
+  Some(<first relays[].url from §4.12, cached; else https://linksy-relay.diary.mg>)`.
+  `Settings.relay` (a relay the user hosts, set in Preferences / Settings, checked as an
+  `https` URL, blank = none) wins over `Config.relay`; changing it closes the away
+  endpoint and starts it again on the new relay. The
+  node then makes an away key (`away.key` in the data dir), puts its away address in
+  `DeviceInfo.away` (`{"id","relay","addrs"}`, in the handshake only), takes away
+  connections from paired devices, and **falls back to away by itself** when a device
+  doesn't answer on the network (`ensure_connection`). `node.connect_away(id)` forces it.
+- **Only while needed (desktop 0.9.12).** With a relay, the core runs the iroh endpoint
+  only while a paired device could use it: one whose away address is known and whose week
+  (below) isn't over. Otherwise it rests, since it holds about 10 MB and is never idle:
+  `DeviceInfo.away` then carries `{"id","relay"}` without `addrs`, enough to reach it
+  through the relay once it runs. It starts as soon as pairing or a handshake brings such
+  a device, and stops two minutes after there's none (forgotten, or the week over).
+  Without a relay it always runs. `node.away_running()` says which. Nothing to do on the
+  phone beyond taking the new core.
+- **Switching networks (desktop 0.9.12).** A device that leaves a network can't say
+  goodbye on it, so its old link used to linger until the 30 s idle timeout, and the
+  other side refused its away connection as a duplicate meanwhile. Now:
+  - **`node.network_changed()`**: call it whenever the device's networks change. It checks
+    every link that isn't away (a `ping` it must acknowledge within 2 s), closes the
+    ones that don't answer, dials again those that stay connected (either side's
+    `stay_connected`), and tells iroh (`Endpoint::network_change`, which Android can't
+    do by itself). The computer calls it on its own address changes (rtnetlink).
+    **Phone to-do:** call it from a `ConnectivityManager.NetworkCallback`
+    (`onAvailable`, `onLost`, `onLinkPropertiesChanged`), at most about once a second.
+  - **Before refusing a duplicate**, a node checks that the old link still answers
+    (same 2 s check), so the device that moved gets in at once.
+  - **Dialing races the network and away**: away starts at once for a device not seen on
+    the network, and after 1 s for one that is; the first to connect wins, and the network
+    still replaces away once found.
+  - `ping` is how links are checked: keep ignoring it quietly.
+- **Links.** Away connections come from `127.0.0.2` (the bridge), USB from other loopback
+  addresses, the network from anywhere else: `link_of(addr)` / `node.link(id)` →
+  `Link::{Usb, Lan, Away}`. A better link replaces a worse one to the same device (both
+  sides agree), and finding the device on the network again replaces away.
+  `DeviceView.away` is true when connected away.
+- **The lease: 7 days.** A device may connect from away for a week after it was last
+  connected on the same network or by cable (`TrustedDevice.last_met`, renewed on every
+  such connection; pairing counts). After that its away connections are refused until
+  they meet again. `DeviceView.away_until` says until when, and is `None` until the
+  device's away address is known (they met on the same network with both running 0.6) or
+  while away from home is off here: only show "Reachable from away" when it's set.
+- **What's refused from away** unless the user allowed everything for that device
+  (`node.set_away_all(id, true)`, `TrustedDevice.away_all`): every media or input session
+  (screen, control, display, camera, microphone, input), answered
+  `{"type":"session_decline","reason":"away"}` (`Error::NotFromAway` for the requester),
+  and file browsing (`fs`, answered with an error). Always allowed: clipboard, links,
+  files sent (asked as usual), ring, battery, notifications, media controls, locate.
+- **Lock When Away** must ignore heartbeats that arrive from away (`node.link(id) ==
+  Some(Link::Away)`): far away is not nearby. The computer does.
+- **Settings:** `Settings.away` (default on) turns it off entirely. *Desktop 0.11.3:* off
+  closes the endpoint at once, so the relay hears nothing more (it used to wait the two
+  minutes an unneeded endpoint gets); `linksy settings away off` sets it too. `linksy-core`
+  has a default feature `away`: built with `--no-default-features`, iroh isn't compiled
+  in, `Settings.away` reads off and turning it on fails with "this Linksy was built
+  without away from home". The phone app can do the same for builds that want no relay.
+
+**Phone to-do:** turn it on in `Config` (above); a Settings switch "Away from home"
+(`Settings.away`) and, per computer, "Allow everything from away" (`set_away_all`);
+show "Connected away from home" when `DeviceView.away`, and "Reachable from away until
+<date>" from `away_until`. With "Keep running in the background" the phone stays
+reachable from away; otherwise it connects when opened. Test against a computer:
+`fake_phone --away` plays the phone, and the core test
+`away_from_home_connects_and_keeps_screens_local` shows the whole flow.
+
+### 4.14 Locate (desktop 0.6.0)
+
+The computer asks a phone where it is, once; nothing is kept and there's no tracking.
+
+```json
+{"type":"locate"}                                                     // computer → phone
+{"type":"location","lat":-18.8792,"lon":47.5079,"accuracy_m":15,"at_ms":1792...}  // phone → computer
+{"type":"location_refused","reason":"Location is off on this phone"}  // or this
+```
+
+Core: `Event::LocateRequest { from }` on the phone; answer with `node.send_location(from,
+lat, lon, accuracy_m, at_ms)` or `node.refuse_location(from, reason)` within 30 s. The
+computer shows the position with an "Open Map" link (OpenStreetMap). **Phone to-do:** a
+setting "Let computers locate this phone" (off by default); when on, take one fresh fix
+(`FusedLocationProviderClient.getCurrentLocation`, or `LocationManager`), which needs
+`ACCESS_FINE_LOCATION` granted while in use (and `ACCESS_BACKGROUND_LOCATION` for when the
+app is in the background; fine for a sideloaded app, and the setting explains why);
+otherwise refuse with a reason. Announce `locate` in `features` (§4.10); the computer
+only offers it then. It works away from home too (§4.13).
+
+### 4.15 Terminal (desktop 0.7.0)
+
+A real shell on the computer, shown on the phone: Claude Code, neovim, htop, git, builds.
+**The phone opens it; the computer never opens one on the phone.** Built on the desktop
+in 0.7.0 exactly as below (core: `node.request_terminal(to, TerminalOpen { code, cols,
+rows, resume })` returns the `Session` and the terminal id; `node.list_terminals(to)` and
+`Event::Terminals`). Test against a computer with `fake_phone --terminal CODE` (`--type`,
+`--resume`, `--close`). The desktop's Flatpak runs the computer's own shell (through
+`flatpak-spawn --host`) and announces `terminal` from 0.10.0; older Flatpaks don't.
+
+**Safety, in layers (all enforced by the computer, never by the phone):**
+
+1. Paired devices only, end to end encrypted as everything else.
+2. **Off by default, per phone**: "Allow Terminal" on the computer, for that phone.
+3. **A terminal code set on the computer** (Preferences › Terminal: 6+ digits or a
+   passphrase). The computer keeps only a hash (Argon2id). The phone asks for it **every
+   time a terminal opens** and never stores it (no "remember me", no biometric shortcut).
+   5 wrong codes in a row lock the terminal for that phone until it's unlocked on the
+   computer, which says so in a notification.
+4. **The computer asks its user** the first time each day ("Pixel 9 wants a terminal",
+   Allow / Don't Allow), as for screens.
+5. **Not from away** (§4.13) unless "Allow Everything From Away" is on for that phone.
+6. Visible while open: a notification on the computer ("Terminal open from Pixel 9",
+   End), and each opening in the activity history.
+7. The user's normal account, never root (`sudo` still asks the computer's password).
+   Unpairing ends that phone's terminals at once.
+
+**Feature:** computers that can do it announce `"terminal"` in `features` (§4.10); the
+phone shows "Terminal" only for them. Whether it's allowed for *this* phone is only known
+by asking (it can change any time).
+
+**Opening (a media-style session, §4.8; the phone is the requester):**
+
+```json
+{"type":"session_request","id":"<uuid>","kind":"terminal",
+ "code":"<the code as typed>","cols":80,"rows":24,
+ "resume":"<terminal id>"}                    // optional: reattach (below)
+```
+
+Answers:
+
+```json
+{"type":"session_accept","terminal":"<terminal id>"}
+{"type":"session_decline","reason":"off"}      // terminal not allowed for this phone
+{"type":"session_decline","reason":"code"}     // wrong code; "tries_left": 3
+{"type":"session_decline","reason":"locked"}   // too many wrong codes; unlock on the computer
+{"type":"session_decline","reason":"away"}     // from away and not allowed
+{"type":"session_decline","reason":"limit"}    // 8 terminals already run for this phone
+{"type":"session_decline"}                     // the computer's user said no
+{"type":"session_decline","reason":"unsupported"}
+```
+
+Show each reason as such ("Wrong code, 3 tries left", "Turn on Allow Terminal for this
+phone on the computer", "Unlock the terminal on the computer"…).
+
+**After `session_accept`:**
+
+- **Computer → phone:** the raw terminal output (bytes from the pseudo-terminal, UTF-8
+  with escape sequences), no framing, until the stream ends. Feed it straight to the
+  terminal view. The shell runs with `TERM=xterm-256color`, `COLORTERM=truecolor`, in the
+  user's home, as their login shell.
+- **Phone → computer:** framed JSON (u32 BE length + JSON, as `control` sessions):
+
+  ```json
+  {"type":"term_input","data":"ls -la\r"}      // what was typed, as text (Ctrl+C is "\u0003")
+  {"type":"term_resize","cols":64,"rows":30}    // on rotation, keyboard shown or hidden, font size
+  {"type":"term_close"}                         // end the shell (the computer then ends the stream)
+  ```
+
+  Keys map to the usual xterm sequences: Enter `\r`, Backspace `\u007f`, Tab `\t`, Esc
+  `\u001b`, arrows `\u001b[A`…`\u001b[D`, Ctrl+letter = letter & 0x1f, Alt+key = `\u001b`
+  then the key. Mouse reporting and bracketed paste are whatever the program asks for;
+  send them as `term_input` too.
+
+**Closing, the rules both sides keep (so nothing is left hanging):**
+
+- **Closing a terminal on the phone** (its tab's close button, `exit` typed in it): send
+  `term_close`. The computer ends the shell and everything started in it, then finishes
+  the stream. Nothing keeps running.
+- **Leaving it** (switching apps, the phone locking, the network dropping, the app being
+  killed): just finish the stream, or let it drop. The shell stays, detached (next point).
+- **Ended on the computer** (End on the phone's page in Linksy there, the code turned
+  off, the phone no longer allowed, or unpaired): the stream finishes right away. Show
+  "Ended on the computer" and drop that tab; `resume` won't find it.
+- **The shell exits by itself**: the stream finishes too; close the tab.
+- Once a terminal's stream ends, the session is gone on both sides: the connection goes
+  back to idle and closes as usual (§4.6) when nothing else uses it.
+
+**Terminals outlive the connection.** Finishing the stream *without* `term_close`
+(network change, app closed, phone locked) only detaches: the shell keeps running on the
+computer for up to 24 hours. Reattach with `"resume":"<terminal id>"` (the code is asked
+again); the computer redraws the screen on attach. Several terminals at once are fine
+(tabs), each its own session. To list the running ones:
+
+```json
+{"type":"terminal_list"}                                            // phone → computer (connection message, §4.5)
+{"type":"terminals","list":[{"id":"…","title":"claude — ~/Project","started_ms":1792…}]}
+```
+
+`title` follows the shell's window title (OSC 0/2). A terminal whose shell exits finishes
+its stream and leaves the list.
+
+**Phone to-do:** a terminal view (xterm.dart or similar) with true colour, mouse and
+resize; a key bar above the keyboard (Esc, Ctrl, Alt, Tab, arrows, `|`, `~`, `/`, `-`);
+the code prompt before each open (numeric or text keyboard, masked); tabs for several
+terminals and reattach from `terminal_list`; a clear "Detached, still running on the
+computer" state. Until the desktop ships it, computers don't announce `terminal`.
+
+### 4.16 Private discovery (desktop 0.9, implemented)
+
+[desktop#38](https://github.com/LinkSy-mg/linksy-desktop/issues/38),
+[mobile#12](https://github.com/LinkSy-mg/linksy-mobile/issues/12). The §4.1 record puts a
+device's permanent id, its name and its OS on every network it joins, so anyone on a café's
+or an office's Wi-Fi can recognise the same phone from place to place. Private discovery
+announces only a **tag that changes every 15 minutes and that only paired devices can
+recognise**. Strangers see an unnamed Linksy device whose label they can't link to the one
+before, unless the device is being added (pairing mode, below).
+
+**The discovery key.** Each device has its own random 32-byte **discovery key** `D`, kept
+in its data folder (desktop: `discovery.key`). It shares `D` with each paired device over
+their encrypted connection, and keeps each paired device's key in its trust list.
+
+- On every connection to a paired device, once the handshake is done, each side sends
+  (unidirectional stream, §4.5):
+
+  ```json
+  {"type":"discovery_key","key":"<64 hex chars>"}
+  ```
+
+  The receiver stores it for that device (replacing an older one). Older versions ignore
+  the message (unknown types are skipped).
+- A device knows a paired device **speaks §4.16** once it has received that device's own
+  `discovery_key`.
+- **Unpairing rotates the key:** forgetting a device makes a new `D`, sent right away to the
+  paired devices connected now and to the others on their next connection, so a forgotten
+  device can't keep recognising this one. Until they've connected, they find it by its last
+  address (§4.6).
+
+**The tag.** Time is cut into 15-minute epochs: `e = floor(unix_seconds / 900)`.
+
+```
+tag(D, e) = first 16 bytes of HMAC-SHA256(key = D, data = "linksy discovery v2" || u64_be(e))
+```
+
+as 32 lowercase hex chars. Test vector: `D` = bytes `00 01 02 … 1f`, `e` = `1959000` →
+`9f88efcbdfd95b47eee92701da5f9d99` (desktop: `discovery::tests`).
+
+The record, re-registered at each new epoch (a goodbye for the
+old one):
+
+- Service type: `_linksy._udp.local.` (unchanged), port unchanged.
+- Instance name: `Linksy <first 8 hex of the tag>`; host name `linksy-<first 8 hex>.local.`
+- TXT: `v` = `2`, `t` = the tag. Nothing else.
+
+**Recognising a paired device.** For each paired device with a stored key, compute its tag
+for `e - 1`, `e` and `e + 1` (clocks a few minutes apart) and compare with every `t` seen.
+A match means "that device is here, at these addresses": dial it as before (§4.6). The TLS
+handshake still proves who it is; a tag is never trusted for more than choosing whom to
+dial. Re-check at each epoch.
+
+**Browse again at each epoch.** At a new epoch every paired device shows up under a new
+instance name, and a browser that misses it may not ask again for a long time: mDNS
+libraries query less and less often (mdns-sd: up to once an hour) and give up resolving a
+new instance after a few seconds, which a phone or a laptop in Wi-Fi power saving easily
+misses. A paired device then stays "not nearby" while it's right there
+([desktop#50](https://github.com/LinkSy-mg/linksy-desktop/issues/50)). So start a fresh
+browse (or send a fresh query) a few seconds after each epoch boundary, and soon after a
+paired device's record goes away (goodbye or no answer), in case its new record was missed.
+Desktop: 5 s after the boundary and 1 s after a loss (`discovery.rs`). Android: restart
+`NsdManager` discovery the same way if it doesn't requery on its own.
+
+**Pairing mode.** A device being added has to be findable by strangers. While its
+**Add Device** screen is open (computer: the invite dialog; phone: the add or scan screen),
+and for at most 5 minutes, a device also announces a second record in the §4.1 format
+(`id`, `name`, `kind`, `os`) with `v` = `2` and `p` = `1`. Others list it under "Nearby,
+not paired" as before. A device not in pairing mode isn't listed to strangers; pairing
+works as long as one of the two is (the other dials it), and Pair by Address and QR codes
+work as before.
+
+Desktop: the invite dialog (Add Device) is pairing mode, so two computers find each other
+when both have it open. While a device also announces its §4.1 record (below), that record
+already lists it, and no separate pairing record is sent.
+
+**Moving over from §4.1.** A device keeps announcing its §4.1 record next to the private
+one **only while one of its paired devices doesn't speak §4.16 yet** (it hasn't received
+that device's `discovery_key`). Once every paired device has moved over, it stops, and its
+id, name and OS leave the network. A new install with nothing paired announces only the
+private record (and the pairing record while being added). Old versions keep reaching an
+upgraded device through the §4.1 record until then, and through its last address after.
+
+**Not covered:** the device's IP and MAC addresses (Android and most desktops use a random
+MAC per network), and the QUIC port (47200 on computers, which only says "Linksy").
+
+### 4.17 Direct links: Wi-Fi Direct for big transfers (desktop 0.9.9)
+
+Over a home network, a file goes phone → router → computer: two trips through the air,
+sharing the same airtime, at whatever signal each device has to the router. Measured on a
+realme 15 Pro and a ThinkPad E14 (MediaTek MT7921) on a 5 GHz router: about 20 MB/s, the
+same as a browser download. A **direct link** is a Wi-Fi network of the two devices' own
+(Wi-Fi Direct, as AirDrop and Quick Share do): one trip, at close range. Expected 40 to
+80 MB/s on Wi-Fi 6 hardware, to be measured.
+
+**Who does what.** The **host** (feature `direct_host`, a phone) makes the link: Android
+does Wi-Fi Direct without asking the user when the app starts it. The **joiner**
+(`direct_join`, a computer) joins it with NetworkManager, without root, and stays on its
+own Wi-Fi network meanwhile where the card can do both (most can; the internet stays
+there). Each app does the Wi-Fi part; the core relays the steps between them, waits for
+the link, and carries the transfers over a **second QUIC connection** on it (`hello` with
+`intent: direct`, §4.4). The usual connection stays up for everything else.
+
+**When.** The sender's core sets a link up before sending files of **256 MiB or more**
+(`Config.direct_min`), or an eighth of that when the devices are connected away from home
+(§4.13: they may still be side by side), never over a USB cable. Once it has seen how fast
+the routes to a device are, it works out instead whether a link gets the bytes there
+sooner, and can prepare one while the user chooses (§4.22). It waits at most
+**45 s** (the first real one took 25 s), then sends over the usual connection. A link that failed isn't tried again with
+that device for 10 minutes. `node.direct_link(id)` sets one up on demand (for testing).
+A link with no transfer for **20 s** (`Config.direct_idle`) closes on both sides:
+`Event::DirectEnded`.
+
+**Steps** (unidirectional `direct` messages; their order on the wire isn't guaranteed, so
+handle `up` before `connecting` too):
+
+```json
+{"type":"direct","step":{"type":"ask"}}                                     // joiner → host: "set one up"
+{"type":"direct","step":{"type":"invite","address":"02:00:00:00:00:00","name":"realme 15 Pro 5G"}} // host → joiner: its Wi-Fi Direct address and name
+{"type":"direct","step":{"type":"listening","address":"d8:80:83:cb:0d:33"}} // joiner → host: findable at this address
+{"type":"direct","step":{"type":"connecting"}}                              // host → joiner: connecting to you now
+{"type":"direct","step":{"type":"up","ip":"192.168.49.1","port":47200}}     // host → joiner: Linksy is here on the link
+{"type":"direct","step":{"type":"end","reason":"no Wi-Fi Direct permission"}} // either way, reason optional
+```
+
+1. **Start.** The sender wants a link. A host sender's core emits `Event::DirectWanted`
+   to its own app; a joiner sender's core sends `ask`, and the host's core emits
+   `DirectWanted` there. A host that can't answers `end`.
+2. **Host app**, on `DirectWanted {id}`: make sure Wi-Fi Direct is usable, start
+   discovering peers, and send `invite` with its own Wi-Fi Direct device address and
+   **name**. Android gives apps `02:00:00:00:00:00` instead of their own address, so the
+   joiner finds the host by its name (`name`, else its Linksy name), and only when exactly
+   one device around has it.
+3. **Joiner app**, on `Event::Direct {step: invite}`: become findable and send `listening`
+   with its own address.
+4. **Host app**, on `listening`: wait until that address shows up among the peers, connect
+   to it as push-button with group-owner intent 15 (so the phone hosts), then send
+   `connecting`.
+5. **Joiner app**, on `connecting`: connect back to the host's address (push-button too).
+   The joiner refusing the phone's first request until then is normal Wi-Fi Direct ("info
+   currently unavailable"): the phone waits for the joiner's request, and because both
+   asked, neither device shows an invitation dialog.
+6. **Host app**, once the group is formed: send `up` with its own IPv4 address in the
+   group (as group owner, `192.168.49.1`) and its Linksy port (`node.local_addr()`).
+7. **Joiner app**, once its side is connected and `up` arrived: `node.direct_dial(id, ip:port)`.
+   Both cores emit `Event::DirectLinked`, and transfers go over it.
+8. **End.** On `Event::DirectEnded` (idle, failed, or ended by the other side), each app
+   drops its part: the host removes its group, the joiner disconnects. Either app ends a
+   failed attempt with `node.direct_end(id, Some(reason))`.
+
+Checks in the core: addresses must look like `aa:bb:cc:dd:ee:ff`; `up` must carry a
+private (or link-local) IPv4 address and a port, so a paired device can't point the
+joiner anywhere else. The second connection is mutual TLS as always; Wi-Fi Direct's own
+WPA2 is on top.
+
+**Phone to phone: a group with a passphrase (core ≥ this change).** Two phones can't use
+the steps above: Android gives each app `02:00:00:00:00:00` for its own address, so neither
+can tell the other where it is, and an incoming connection the app didn't start shows a
+dialog. Instead the host makes a group with a name and a passphrase, and the joiner joins
+it with them, which Android 10 and later do without any prompt or address.
+
+- **Feature `direct_group`:** the device hosts and joins groups by name and passphrase.
+  Phones announce `direct_host`, `direct_join` and `direct_group`. A Linux computer doesn't:
+  NetworkManager joins a Wi-Fi Direct group only through its push-button setup; joining by
+  passphrase would mean an ordinary Wi-Fi connection that takes the computer off its own
+  network. So phone ↔ computer keeps the steps above, phone ↔ phone uses the group.
+- **Who hosts:** when both could host and join, **the device with the smaller id hosts**
+  (byte-wise, as for duplicate connections, §4.4). Both cores work it out the same; the
+  other sends `ask` as usual. `DirectWanted` only ever comes on one of the two.
+- **Credentials:** when both have `direct_group`, the core generates them and puts them in
+  `Event::DirectWanted { id, group: Some(DirectGroup { ssid, passphrase, frequency: None }) }`:
+  `DIRECT-xy-Linksy` and 20 random characters. Checked on both sides: the name starts with
+  `DIRECT-`, at least `DIRECT-xy`, at most 32 bytes; the passphrase is 8 to 63 printable
+  ASCII characters; a frequency is 2400 to 7125 MHz. The passphrase travels only inside the
+  paired devices' TLS connection, `Debug` prints it as `…`, and the apps must not log it.
+  `direct_send` refuses a group `invite` to a device without `direct_group`.
+
+```json
+{"type":"direct","step":{"type":"invite","address":"02:00:00:00:00:00","name":"Pixel 9",
+ "group":{"ssid":"DIRECT-k4-Linksy","passphrase":"…20 characters…","frequency":5180}}}
+{"type":"direct","step":{"type":"up","ip":"192.168.49.1","port":47200}}
+```
+
+Steps (no `listening`, no `connecting`):
+
+1. The sender wants a link; the host (smaller id) gets `DirectWanted { id, group: Some(g) }`
+   (the other one sends `ask` first, as above).
+2. **Host:** `removeGroup` (anything left over), then
+   `createGroup(channel, WifiP2pConfig.Builder().setNetworkName(g.ssid).setPassphrase(g.passphrase)
+   .setGroupOperatingBand(GROUP_OWNER_BAND_5GHZ when WifiManager.is5GHzBandSupported(), else
+   GROUP_OWNER_BAND_AUTO).enablePersistentMode(false).build(), listener)`. Once it's up:
+   `requestGroupInfo` for its `frequency`, then
+   `direct_send(id, Invite { address, name: Some(deviceName), group: Some(g with frequency) })`,
+   and right after, `direct_send(id, Up { ip: groupOwnerAddress (192.168.49.1), port: node.local_addr().port })`.
+3. **Joiner**, on `Event::Direct { step: Invite { group: Some(g), .. } }`:
+   `connect(channel, WifiP2pConfig.Builder().setNetworkName(g.ssid).setPassphrase(g.passphrase)
+   (.setGroupOperatingFrequency(f) when g.frequency is Some(f)).build(), listener)`. Only one of
+   the band or the frequency may be set on a Builder. When
+   `WIFI_P2P_CONNECTION_CHANGED_ACTION` says `groupFormed` and not `isGroupOwner`, and `up`
+   has arrived (either order): `node.direct_dial(id, ip:port)`.
+4. Both get `DirectLinked`; transfers go over it. Same limits as above: 256 MiB, 45 s,
+   10 minutes after a failure, closed after 20 s idle, a live link never restarted.
+5. **End:** on `DirectEnded`, both `removeGroup` (the joiner leaves, the host closes it),
+   the joiner also `cancelConnect`. Failures of the app's own: `direct_end(id, Some(reason))`
+   first. Never log `g.passphrase`.
+
+**Android, the host** (`WifiP2pManager`, API 29+ for `requestDeviceInfo`):
+
+- Announce `direct_host` where `PackageManager.FEATURE_WIFI_DIRECT` exists. Permissions:
+  `ACCESS_WIFI_STATE`, `CHANGE_WIFI_STATE`, and `NEARBY_WIFI_DEVICES` (Android 13+, with
+  `usesPermissionFlags="neverForLocation"`) or `ACCESS_FINE_LOCATION` (12 and older).
+  Without them, or with Wi-Fi off, answer `DirectWanted` with
+  `direct_end(id, "no Wi-Fi Direct permission")` / `"Wi-Fi is off"`; the core then sends
+  over the network as before.
+- `DirectWanted`: `removeGroup` (anything left over), `requestDeviceInfo` for this phone's
+  `deviceAddress` (`02:00:00:00:00:00` for apps: send it anyway) and `deviceName`,
+  `discoverPeers`, then `direct_send(id, Invite { address, name: Some(deviceName) })`.
+- `listening {address}`: on each `WIFI_P2P_PEERS_CHANGED_ACTION`, `requestPeers` until a
+  peer's `deviceAddress` equals `address` (compare lower-case). Then `connect` with
+  `WifiP2pConfig().apply { deviceAddress = address; wps.setup = WpsInfo.PBC;
+  groupOwnerIntent = 15 }` (not the `Builder`, which is for groups with a passphrase), and
+  on success `direct_send(id, Connecting)`.
+- `WIFI_P2P_CONNECTION_CHANGED_ACTION` → `requestConnectionInfo`: when `groupFormed`,
+  send `Up { ip, port }` with `groupOwnerAddress` if `isGroupOwner`, else the phone's
+  IPv4 address on its `p2p…` network interface.
+- `DirectEnded`: `cancelConnect`, `removeGroup`, `stopPeerDiscovery`, unregister the
+  receiver. All of them, also after a failure: a phone still searching, or waiting on a
+  half-made connection (Wi-Fi Direct waits up to 2 minutes for the other side), leaves
+  less airtime for the transfer that falls back to the usual network. First test: 6.7 MB/s
+  for a minute after a failed link, then 15 to 30 MB/s.
+- The QUIC socket must listen on all interfaces (it does: `[::]`), so the computer reaches
+  it over the group.
+
+**Linux, the joiner** (`crates/linksyd/src/direct.rs`): announced only when NetworkManager
+has a Wi-Fi Direct device (`DeviceType` 30, `p2p-dev-wlan0`); `--no-direct` turns it off.
+`StartFind` (30 s) makes it findable; its address comes from `iw dev` (the `P2P-device`),
+or else the Wi-Fi card's own address. On `connecting` it looks for the phone among
+NetworkManager's peers (by address, else by name, up to 10 s) and activates a `wifi-p2p`
+connection to it: the user's own (`connection.permissions`, so no
+password is asked), never saved (`persist: volatile`), dropped if the service goes away
+(`bind-activation: dbus-client`), and never the default route (`ipv4.never-default`).
+`StopFind` when the attempt ends.
+The Flatpak needs `--system-talk-name=org.freedesktop.NetworkManager`.
+
+**Testing it.** Send a file of 256 MiB or more from either side with both apps running
+this version. The computer's log shows each step:
+`journalctl --user -u linksyd -f | grep -i direct` ("setting up a direct link", "direct
+link to … up", or "no direct link: <why>"). Compare the transfer speed with and without
+(`--no-direct`).
+
+### 4.18 Gallery: the phone's photos on the computer (desktop 0.12.1) — `src/gallery.rs`
+
+The computer browses the phone's photos and videos page by page and fetches only the
+thumbnails it shows; nothing is copied until the user saves a photo. Phones and tablets
+only: a computer never shows another computer's Gallery. Feature `gallery` (§4.10) while
+the phone has photo access.
+
+One request per bidirectional stream, like files (§4.9): the first frame is the request
+with `"type":"gallery"`, then the phone's one answer, then it finishes the stream.
+
+```json
+{"type":"gallery","op":"albums"}
+→ {"type":"gallery_albums","albums":[{"id":"camera","name":"Camera","count":1104}]}
+{"type":"gallery","op":"items","album":"camera","before":{"taken_ms":1730000000000,"id":"41"},"limit":120}
+→ {"type":"gallery_items","items":[{"id":"40","name":"IMG_20261102.jpg","taken_ms":1729999990000,"size":3400000},
+     {"id":"39","name":"VID_1.mp4","video":true,"taken_ms":1729999000000,"size":90000000,"duration_ms":14000}],"more":true}
+{"type":"gallery","op":"thumb","id":"40","size":256}
+→ {"type":"gallery_data","length":18234} then that many bytes of JPEG
+{"type":"gallery","op":"send","ids":["40","39"],"transfer":"<uuid>"}
+→ {"type":"gallery_ok"}, then the phone sends those files as an ordinary transfer (§4.5)
+     whose offer has "id":"<uuid>" and "import":true
+any of them → {"type":"gallery_error","message":"…"}
+```
+
+- `items`: newest first by when taken (`DATE_TAKEN`, else `DATE_ADDED`), photos and videos
+  together; without `album`, all of them. `before` is the last item of the previous page
+  (its time and id, for photos taken in the same millisecond); none: the newest. At most
+  500 per page (the computer asks for about 120). `id` is the phone's own (`MediaStore`
+  `_ID`); `name` the file name.
+- `thumb`: a JPEG `size` px on its longer side (32 to 1024; the computer asks 256), at
+  most 256 KiB. `ContentResolver.loadThumbnail` does it on Android 10+.
+- `send`: the computer chose the transfer id and takes that transfer without asking, into
+  its pictures folder, even when photo import is off. Core: answer `call.ok()`, then
+  `Node::send_gallery(from, paths, transfer)` (copy each item out of `MediaStore` to a
+  cache file first, or stream it).
+- Tell the computer when the library changes (a photo taken, a screenshot, one deleted):
+  `{"type":"gallery_changed"}` (`Node::gallery_changed`), at most every 2 s. It reloads
+  the first page.
+- Core API: `Node::incoming_gallery()` gives the requests (`GalleryCall`: `albums`,
+  `items`, `thumb`, `ok`, `error`). A device that takes none answers "doesn't share its
+  photos"; from away it answers "only on the same network" like files.
+
+### 4.19 Deck: the phone as buttons for the computer (desktop 0.12.1)
+
+The computer says what it lets that phone do, and runs it. Computers announce feature
+`deck`. The layout (pages of tiles, sizes, colours, a theme) is made in the computer's
+editor and comes to a phone that announces `deck_layout` (§4.20); a phone without it lays
+its tiles out itself.
+
+```json
+phone → computer {"type":"deck_open"}           the deck shows: send me what I may do
+computer → phone {"type":"deck_actions","actions":[
+                    {"id":"media.play_pause","name":"Play or Pause","kind":"button","group":"Media"},
+                    {"id":"sound.volume","name":"Volume","kind":"slider","group":"Sound"},
+                    {"id":"sound.mute","name":"Mute","kind":"toggle","group":"Sound"},
+                    {"id":"sound.output","name":"Sound Output","kind":"button","group":"Sound"},
+                    {"id":"system.restart","name":"Restart","kind":"button","group":"System","confirm":"Restart Office PC?"},
+                    {"id":"network.wifi","name":"Wi-Fi","kind":"toggle","group":"Network","confirm":"This can disconnect Pixel 9 from Office PC."},
+                    {"id":"command.3f2a…","name":"Backup","kind":"button","group":"Commands"}]}
+computer → phone {"type":"deck_state","states":[{"id":"sound.volume","value":0.42},{"id":"sound.mute","on":false},
+                    {"id":"sound.output","text":"Speakers"},{"id":"network.wifi","on":true}]}
+phone → computer {"type":"deck_run","action":"sound.volume","value":0.6}
+phone → computer {"type":"deck_close"}          the deck is gone: stop sending state
+```
+
+- `kind`: `button` (run it), `toggle` (run it to flip; its state says `on`), `slider` (run
+  it with `value` 0 to 1; its state says `value`).
+- `confirm` (optional): ask this before running it (Cancel, or the action's `name` to go
+  on), and run it only on yes. It's in the computer's language with the names filled in.
+- `text` in a state (optional): what the tile shows besides, like `sound.output`'s output.
+  Both fields are new; an older core ignores them. A `kind` the core doesn't know would
+  fail the whole `deck_actions`, so the computer adds none.
+- `deck_actions` comes on `deck_open` and again whenever the user turns one on or off on
+  the computer; `deck_state` while the deck is open, when something changes. The list is
+  only what's on for that phone: anything else the phone runs is refused (ignored), so a
+  tile whose action left the list should show as unavailable, not disappear.
+- Ids, each only where this computer can do it (a missing tool means it isn't offered):
+
+  | Group | Id | Kind | State | Desktop does it with |
+  |---|---|---|---|---|
+  | `Media` | `media.play_pause`, `media.next`, `media.previous` | button | | the player that's playing, else the first paused one |
+  | `Sound` | `sound.volume` | slider | `value` | wpctl, or pactl |
+  | `Sound` | `sound.mute`, `sound.mic_mute` | toggle | `on` | wpctl, or pactl |
+  | `Sound` | `sound.output` | button | `text`: the output's name | the next output becomes the default (wpctl, or pactl) |
+  | `System` | `system.lock` | button | | the desktop's screen lock |
+  | `System` | `system.dnd` | toggle | `on` | GNOME: banners off; Plasma: the notifications inhibited |
+  | `System` | `system.restart`, `system.shutdown` | button, `confirm` | | logind (it asks for a password where its rules want one) |
+  | `Network` | `network.wifi` | toggle, `confirm` | `on` | nmcli |
+  | `Network` | `network.bluetooth` | toggle | `on` | bluetoothctl, or rfkill |
+  | `Network` | `network.airplane` | toggle, `confirm` | `on`: every radio off | GNOME's airplane mode, else nmcli and Bluetooth |
+  | `Power` | `power.saver`, `power.balanced`, `power.performance` | toggle | `on` for the active profile | powerprofilesctl (performance only where it has it) |
+  | `Power` | `power.auto` | toggle | `on` | GNOME's power saver on low battery |
+  | `Commands` | `command.<id>` | button | | the user's own commands (a name and a command line, set on the computer) |
+
+  More may come; show any id with its `name` and `kind`. `group` is in English whatever
+  the language (`name` is in the computer's).
+- Desktop: media, sound, power profiles, Do Not Disturb, Lock, Wi-Fi and Bluetooth are on
+  for a phone until the user turns them off; restart, turn off, airplane mode and the
+  user's commands are off until turned on (or until a tile for it is saved, §4.20). A
+  tile kept from before whose action the computer no longer offers stays in its layout;
+  the phone shows it as unavailable. A
+  `deck_state` comes after every run that was allowed, so a refused run gets no answer.
+  While a slider is dragged, the computer may skip to its newest value.
+- Core: `Node::deck_open(to, open)`, `Node::deck_run(to, action, value)`;
+  `Event::DeckActions`, `Event::DeckState`.
+
+### 4.20 Deck layouts: made on the computer, drawn by the phone (desktop 0.12.1)
+
+The user lays out a phone's deck in the computer's editor; the computer keeps the layouts
+(one set per phone) and sends them. The phone draws them and runs their tiles as in §4.19.
+Phones that do announce feature `deck_layout`; the computer sends nothing new to a phone
+that doesn't.
+
+```json
+phone → computer {"type":"deck_open"}
+computer → phone {"type":"deck_actions",…}       as in §4.19
+computer → phone {"type":"deck_layout","layouts":{"version":3,"active":"work","layouts":[
+                    {"id":"work","name":"Work","theme":{"id":"dots","accent":"#2563ff"},
+                     "portrait":{"grid":[4,8],"pages":[[
+                       {"id":"clock","kind":"clock","x":0,"y":0,"w":2,"h":1,"props":{"zone":"Europe/Paris"}},
+                       {"id":"lock","kind":"button","x":2,"y":0,"w":1,"h":1,"label":"Lock","color":"#e01b24","action":"system.lock"},
+                       {"id":"music","kind":"music","x":0,"y":1,"w":4,"h":2},
+                       {"id":"vol","kind":"volume","x":0,"y":3,"w":4,"h":1,"action":"sound.volume"}]]},
+                     "landscape":{"grid":[9,4],"pages":[[{"id":"music","kind":"music","x":0,"y":0,"w":4,"h":2}]]}}]}}
+computer → phone {"type":"deck_state",…}         as in §4.19
+```
+
+- When: on every `deck_open` (after `deck_actions`, before `deck_state`; each message is a
+  stream of its own, so they may arrive in another order), and again with `deck_actions`
+  whenever the user saves the layouts while the deck shows. Take each one that comes: it is
+  the computer's current set. `version` goes one up on every save; `0` is the first layout
+  the computer makes up from what it offers before the user saves anything.
+- `active` is the layout to show (the id of one of `layouts`). A face per orientation:
+  `grid` is columns and rows (the editor uses 4 × 8 portrait and 9 × 4 landscape), `pages`
+  the tiles of each page. A tile sits at `x`, `y` (cells from the top left) and is `w` × `h`
+  cells; tiles stay inside the grid and don't overlap. Its `id` is unique on its page.
+  Optional: `label` (empty: the action's `name`), `color` (`#rrggbb`, for themes that
+  colour tiles), `action` (for the kinds that run one), `props` (strings a kind needs
+  besides, like a clock's `zone`).
+- Kinds and the sizes they take (width × height, the first is the default):
+
+  | `kind` | Sizes | What it is |
+  |---|---|---|
+  | `button` | 1 × 1, 2 × 1 | runs its `action`: any from `deck_actions` (a toggle shows its `on`) |
+  | `volume` | 4 × 1, 2 × 1, 1 × 3 | a slider for `sound.volume` |
+  | `music` | 4 × 2, 2 × 2 | the computer's player (`media_state`, §4.5): cover, title, progress, its buttons |
+  | `clock` | 2 × 1, 2 × 2, 1 × 1 | the phone's own time |
+
+  A kind the phone doesn't know draws as a plain tile with its `label`. A tile whose
+  action isn't in `deck_actions` shows as unavailable.
+- Themes: `stock`, `dots`, `eink`, `term`, `pixel`, with an `accent` colour. The phone draws
+  the theme (the computer sends only its id); one it doesn't know draws as `stock`. The
+  phone may also have themes of its own, beyond these: picked on the phone (a long press
+  on the deck's name, say), such a choice stays on the phone and is drawn instead of the
+  layout's, until the user picks the layout's theme again. The reference looks of the five:
+  https://claude.ai/artifact/7zVv6HaFHYyY2i8sPjeC71
+- Away from the computer, the phone keeps showing the last layouts it got from it (kept
+  per computer, with their `version`); its tiles are unavailable until the computer is
+  back. The phone doesn't send layouts back (it may later).
+- The screen, while the deck shows: the phone keeps it on, over its own screen timeout
+  (`FLAG_KEEP_SCREEN_ON` on the deck's window). After 60 s without a touch it dims to
+  about 20 % brightness (the window's `screenBrightness`), and a touch brings it back.
+  Leaving the deck gives the screen back to the phone's own settings.
+- Limits: at most 20 layouts, 8 pages a face, 64 tiles a page, names and labels of 60
+  characters; the computer refuses to save layouts whose JSON is over 1 MiB less 1 KiB, so
+  the message stays within a frame (§4.4).
+- Desktop: placing a tile in the editor allows its action for that phone (the same as
+  turning it on in §4.19). Until the user saves, the first layout is a clock, the player,
+  the volume and buttons for media, mute, the microphone, the output, Do Not Disturb,
+  Wi-Fi, Bluetooth and locking, those the computer offers; a tile whose action is still
+  off for the phone shows as unavailable.
+- Core: `Event::DeckLayout { from, layouts }` with `linksy_core::DeckLayouts`
+  (`deck_layout.rs`, which also has the kinds, sizes, themes and `check`); the computer
+  sends with `Node::deck_layout(to, &layouts)`, which refuses a phone without the feature.
+
+### 4.21 Turn on: a computer asks the phone (desktop, after 0.12.4)
+
+The computer shows a phone's Inbox and Gallery tabs even while they're off, saying what to
+turn on on the phone, with a link to linksy.diary.mg/help/inbox or /help/gallery. When the
+phone announces `turn_on` (§4.10), the tab also has an **Ask the Phone** button, which sends:
+
+```json
+{"type":"turn_on","feature":"notifications"}   // computer → phone: the Inbox
+{"type":"turn_on","feature":"gallery"}         // or the Gallery
+```
+
+- Core: `Event::TurnOnRequest { from, feature }` (JSON `turn_on_request`) on the phone; the
+  computer sends with `Node::ask_turn_on(to, feature)`. A `feature` over 64 bytes is dropped.
+- Phone: nothing is answered. Ask the user: a sheet when Linksy is open, a notification
+  otherwise, which opens it ("<computer> asks to show this phone's messages", or photos),
+  with Turn On running the same steps as the setting (Notification access with the
+  restricted-settings steps; Android's photo permission, Allow all). At most one prompt per
+  computer and feature a minute. Ignore unknown features; when it's already on, announce
+  the features again.
+- The answer is the phone's `features` (§4.10): once it announces `notifications` or
+  `gallery`, the computer's tab fills by itself.
+
+### 4.22 Phone to phone: the way it goes, a check before sending, and apps (desktop, after 0.12.4)
+
+Everything here is additive: older devices ignore what they don't know, and nothing changes
+between a computer and a phone that doesn't use it. Two phones are the case it is made for,
+but a computer takes part where it makes sense (a computer announces `preflight`).
+
+**1. The way a transfer goes.** Both ends of a transfer hear which route it takes:
+
+```json
+Event::TransferRoute { transfer, route, setting_up_direct?, why_not_direct? }
+```
+
+`route` is `usb` (a cable), `direct` (a Wi-Fi Direct link, §4.17), `lan` (the same network)
+or `away` (the internet, §4.13), worst to best `away < lan < direct < usb`.
+- The receiver gets one, right after `TransferStarted`.
+- The sender gets one with `setting_up_direct: true` while the transfer waits for a direct
+  link to come up (up to 45 s: show "Setting up a direct link…", not a bar stuck at 0), and
+  then the settled one. `why_not_direct` is set when a link was tried and failed ("Wi-Fi is
+  off", "it took too long") and the transfer went the usual way: show it, once.
+- `node.route(id)` is the route a connected device has now; `DeviceView.direct` is true while
+  a direct link is up. The transfer's `route` is what to show next to its speed.
+
+**2. When a direct link pays.** A direct link takes seconds to come up (10 s is the usual,
+25 s was the first one measured) and then moves bytes 3 to 4 times faster than the network
+and 20 times faster than the relay. The core sets one up before a send when that gets the
+bytes there sooner:
+- With nothing known yet about a device, as before: `Config.direct_min` (256 MiB) on the
+  network, an eighth of it when away.
+- After that, from what it has seen: each route's speed to that device (an average of its
+  transfers of 8 MiB or more, newest counting 40%) and how long direct links took. Unmeasured
+  numbers are the usual ones: network 20 MB/s, internet 3 MB/s, direct 75 MB/s, setup 10 s.
+  A direct link is set up when `bytes / now > setup + bytes / direct`. A fast network
+  therefore needs a bigger send before it's worth it, a slow one a smaller.
+- Never over a cable, never between devices that can't make one (§4.17), and not for 10
+  minutes after a failed attempt.
+
+`node.plan_send(id, bytes) -> SendPlan` says what a send would do now, without sending:
+
+```json
+{"route":"lan","direct":{"state":"will"},"seconds":42}
+// direct: {"state":"up"} | {"state":"will"} | {"state":"not","why":{"kind":"cable"|"small"|"unsupported"|"failed","reason":"…"}}
+```
+
+`seconds` is a guess from the same numbers (say "about"). Use it in the picker: "Sending
+2.1 GB · direct link · about 40 s".
+
+**3. Getting the best route ready while the user chooses.** Choosing takes longer than a
+setup. `node.prepare_send(id, bytes)` (call it when the selection changes, at most every
+half second, with what's selected so far) starts a direct link if it will pay (half of the
+setup counts as free, since the user is still choosing), asks the other device to keep it,
+and holds it open for 90 more seconds. It does nothing twice and sends nothing; it returns
+the plan, and `DirectLinked` / `DirectEnded` say how it went. So the Send button is
+already a direct link for anything big. The core tells the other device with one more direct step:
+
+```json
+{"type":"direct","step":{"type":"keep","seconds":90}}   // don't close the link for idleness for this long (at most 180)
+```
+
+A device that doesn't know `keep` ignores it, and its side closes the link when idle (20 s)
+as before. The apps do their Wi-Fi part exactly as in §4.17, whoever asks.
+Send the whole selection in **one** `send_bundle` / `send_files` call: one offer is one
+prompt on the other phone, and its total size is what decides. Offers from one device within
+a second of the first are asked about together, so a queue of several is one prompt too.
+
+**4. Preflight: one question before sending (feature `preflight`).** The sender opens a
+bidirectional stream and sends, as its first message,
+
+```json
+{"type":"preflight","bytes":2147483648,"files":3,
+ "apps":[{"package":"org.mozilla.firefox","version_code":2015987654,"signer":"<64 hex>"}]}
+```
+
+(`apps`: at most 256, what it is about to send, each valid: an Android application id,
+`signer` optional.) The answer, on the same stream:
+
+```json
+{"type":"preflight_reply","free":1400000000,"auto":false,"direct":"ready","can_install":true,
+ "apps":[{"package":"org.mozilla.firefox","have":"older","version_code":2015900000}]}
+```
+
+- `free`: bytes the device will take, when it knows (what is free where files are received,
+  minus `Config.keep_free`, 16 MiB). `has_room_for(bytes)` compares. A phone that copies
+  what it receives to another place (the core receives into its own folder, the app then
+  publishes to Downloads) must report what it can take **at once**: when both copies exist
+  together, half of what is free.
+- `auto`: files from the sender are accepted without asking (otherwise its user is asked,
+  and the sender should say "[Pixel] will ask first").
+- `direct`: `ready`, `wifi_off`, `no_permission`, `unsupported`: whether it could set up a
+  direct link now. The core says `ready` when the device announces `direct_host` or
+  `direct_join`, `unsupported` when not; only the app knows Wi-Fi and permissions, so a
+  phone answers `wifi_off` / `no_permission` itself ("Turn on Wi-Fi on [Pixel] for the fast
+  link").
+- `can_install`: whether it can install apps now (Linksy may install unknown apps), for
+  devices that take apps.
+- `apps`: for each probe it understood, how its own copy compares with the one to be
+  sent: `none` (not installed), `same`, `older` (it has an older one: sending is an update),
+  `newer`, `other_signer` (installed from another developer: Android won't update it, and
+  removing it loses its data: don't offer it). Unknown values from a newer Linksy are
+  `unknown`; treat them as "don't know".
+
+The core answers on its own with `free`, `auto` and `direct`; the app takes the rest from
+`node.incoming_preflight()` (`PreflightCall { from, bytes, files, apps }`, answer with
+`call.answer(PreflightAnswer { free?, direct?, can_install?, apps })` within about two
+seconds, or the core answers without). A sender calls `node.preflight(id, bytes, files,
+probes)`: `Error::Unsupported` for a device without the feature (just send), a timeout after
+6 s. Call it when the user taps Send (or when the picker opens, for the app marks), not for
+every change of the selection.
+
+**5. Room.** A receiver now declines at once an offer that would fill its disk (what is
+left to receive plus `keep_free` more than what's free), instead of failing at the end. The
+sender, after a decline, asks `preflight` and, if there isn't room, ends the transfer with
+"[Pixel] doesn't have room for this: it needs 2.1 GB and has 400 MB free" (`TransferFailed`
+`reason`), otherwise plain "declined".
+
+**6. Apps (feature `apps`).** A phone that announces `apps` sends its installed apps and
+installs the ones it receives. An app is the APK files it is made of (a base and, for most
+apps from Play, splits for the screen, language and processor) in a folder of its own inside
+an ordinary offer, so it has the same resume, hashing, progress and prompt as any file. The
+offer says which folder is which app:
+
+```json
+{"type":"offer","id":"…","files":[
+   {"path":"org.mozilla.firefox-2015987654/base.apk","size":93211045},
+   {"path":"org.mozilla.firefox-2015987654/split_config.arm64_v8a.apk","size":2100000},
+   {"path":"photo.jpg","size":812345}],
+ "apps":[{"package":"org.mozilla.firefox","label":"Firefox","version_code":2015987654,
+          "version_name":"129.0.2","signer":"<64 hex>","dir":"org.mozilla.firefox-2015987654",
+          "icon":"<base64 PNG, ≤ 16 KiB>"}]}
+```
+
+- `dir` is one path component holding only `.apk` files (1 to 64); `signer` is the SHA-256 of
+  the signing certificate (64 hex); `icon` is optional; at most 100 apps. An app that
+  doesn't check out (a bad package name or folder, a file there that isn't an APK, two apps
+  on one folder) is dropped from `apps`: its files still arrive, as files.
+- The sender: `node.send_bundle(id, paths, [AppSend { info, apks }])` (the core names the
+  folder `<package>-<version_code>`, names the files after the APKs, makes odd characters
+  `_`, and refuses a device without `apps`). The APKs are read in place
+  (`ApplicationInfo.sourceDir` and `splitSourceDirs`: readable by other apps), nothing is
+  copied or zipped. Skip system apps and apps the other phone has at `same`, `newer` or
+  `other_signer`.
+- The receiver gets `Event::TransferRequest { …, apps }` and `Event::TransferStarted { …,
+  apps }`: ask "Install Firefox 129.0.2 (update) from Pixel?", not "base.apk". When the
+  transfer is complete, `Event::AppsReceived { transfer, from, apps: [{ info, apks }] }`
+  lists, per app, exactly the files of this transfer (never what an earlier transfer of the
+  same app left in its folder), saved. Install them **together, in one
+  `PackageInstaller` session** (`MODE_FULL_INSTALL`, each file written with
+  `session.openWrite(name, 0, size)`, then `commit`); Android shows its own confirmation.
+  Never install without it.
+- The hints are only a description. Check what arrived with
+  `PackageManager.getPackageArchiveInfo(base, GET_SIGNING_CERTIFICATES)`: its package name,
+  version and signing certificate must be what `apps` says; if not, don't install and say so.
+  An app from another signer than the installed one can't update it: say so, don't
+  uninstall for the user. Delete the saved APKs after the install, or when the transfer is
+  declined or fails.
+- Android needs "Install unknown apps" allowed for Linksy (`canRequestPackageInstalls()`;
+  `ACTION_MANAGE_UNKNOWN_APP_SOURCES` for the user to allow it). Say so before the first
+  app is sent ("[Pixel] needs to allow installs from Linksy": `can_install` in the
+  preflight), not when it arrives. Play Protect may warn about an app installed this way.
+  Linksy for Android is installed from outside the Play Store, which is why none of this
+  needs a Google account.
+- What doesn't move: an app's data and logins. Apps that check a licence with Google or a
+  developer's account may refuse to run.
+
+**7. Limits.** One offer holds at most about 5000 files (its first message is 1 MiB); a
+picker with more sends several offers (they're asked about together). Photos and folders
+are ordinary files; `send_bundle` takes the same paths as `send_files`.
+
+**Core API:** `node.route(id)`, `node.plan_send(id, bytes)`, `node.prepare_send(id, bytes)`,
+`node.preflight(id, bytes, files, probes)`, `node.incoming_preflight()`,
+`node.send_bundle(id, paths, apps)`; `Event::TransferRoute`, `Event::AppsReceived`,
+`apps` on `TransferRequest` and `TransferStarted`; `DeviceView.direct`; `Config.keep_free`;
+features `preflight` and `apps`.
+
+**Phone to-do** (linksy-mobile): announce `preflight` and `apps`; answer
+`incoming_preflight` (room that counts the staging copy, `direct`, `can_install`, the
+probed apps); a picker for the phone's own photos, files and apps that calls `prepare_send`
+as it fills and sends once with `send_bundle`; install what `AppsReceived` lists in one
+session; show `TransferRoute`. The pairing and the 7-day away lease are unchanged (§4.13).
+
+## 5. Core API the app would call (`linksy_core::Node`)
+
+```text
+Node::start(Config) -> Node                 Config { data_dir, download_dir, name, kind, port, bind, discovery, stay_connected, idle_after }
+node.info() -> DeviceInfo                   node.subscribe() -> stream of Event
+node.devices() -> [DeviceView]              DeviceView { device, trusted, connected, nearby }
+node.pair_device(id) / node.pair(addr)      node.respond(request_id, accept)
+node.send_files(id, paths) -> transfer_id   node.cancel(transfer_id)
+node.import_files(id, paths) -> transfer_id // photo auto-import (offer with "import")
+node.send_clipboard(id, text)               node.notify(id, title, body)
+node.send_clipboard_file(id, path) -> transfer_id   // Event::ClipboardFile { from, path } on the receiver
+node.watch_clipboard(id, on)                // Event::ClipboardWatch { from, on } on the receiver
+node.send_picture(id, base64)               // Event::Picture { from, image } on the receiver
+node.send_camera_state(id, session, json)   // Event::CameraState { from, session, state }
+node.connect(addr)                          // USB: dial the computer through the bridge (§4.11)
+node.connect_away(id)  node.link(id) -> Link  node.set_away_all(id, on)   // away from home (§4.13)
+node.locate(id)  node.send_location(id, lat, lon, acc, at_ms)  node.refuse_location(id, why)  // §4.14
+node.open_url(id, url)                      // Event::OpenUrl { from, url } on the receiver
+node.send_battery(id, Battery { level, charging })   node.ring(id, on)   // Event::Battery / Event::Ring
+DeviceView.battery: Option<Battery>         // last level each device reported
+node.post_notification(id, RemoteNotification{…})   node.remove_notification(id, key)
+node.send_media_state(id, &MediaState{ seq, players })   node.media_command(id, player, cmd)
+node.watch_media(id, on)                    // Event::MediaState / MediaCommand / MediaWatch
+node.watch_volume(id, on)  node.set_volume(id, Some(0.4), None)   // Event::VolumeState { from, state }
+node.send_volume_state(id, &VolumeState{ seq, level, muted })     // Event::VolumeWatch / VolumeSet
+node.direct_send(id, DirectStep::Invite { address } | Listening | Connecting | Up { ip, port })   // §4.17
+node.direct_dial(id, addr)  node.direct_end(id, reason)  node.direct_link(id)
+node.route(id) -> Route   node.plan_send(id, bytes) -> SendPlan   node.prepare_send(id, bytes)   // §4.22
+node.preflight(id, bytes, files, probes) -> PreflightReply   node.incoming_preflight()   // §4.22
+node.send_bundle(id, paths, [AppSend { info, apks }]) -> transfer_id   // files and apps, §4.22
+// Event::DirectWanted { id, group } (host: start; group: Some(credentials) phone to phone) / Direct { from, step } / DirectLinked { id } / DirectEnded { id, reason }
+node.send_call_state(id, CallState::Ringing | Active | Idle, contact)
+node.heartbeat(id)                          // Event::HeartbeatWatch { from, on, every_s } says when
+node.sms_threads(id, threads) / node.sms_messages(id, thread, messages, more)   // answers
+node.sms_message(id, thread, message) / node.sms_sent(id, client_id, ok, error)
+// to act on: Event::SmsListThreads / SmsListMessages / SmsSend
+Event::NotificationReply / NotificationAction / NotificationDismissed { from, key, … }   // to act on
+node.settings() / node.update_settings(s)   Settings { name, download_dir, stay_connected, auto_accept }
+node.forget(id)                             node.shutdown()
+node.device_found(device, addrs)            node.device_lost(id)        // platform discovery
+node.create_invite() -> Invite (.to_uri())  node.cancel_invite()        // show a QR code
+node.pair_with_invite(uri)                                              // after scanning one
+node.request_session(id, kind) -> Session   node.incoming_sessions()    // screen mirroring
+```
+
+Events (JSON-serializable, same shapes as the desktop IPC):
+`device_found`, `device_lost`, `device_updated`, `connected`, `disconnected`,
+`pairing_request {request, device, code, incoming, older?}`, `paired`, `pairing_failed`,
+`transfer_request {transfer, from, files, total, apps?}`, `transfer_started`,
+`transfer_progress {transfer, bytes, total}`, `transfer_complete {transfer, saved}`,
+`transfer_failed {transfer, reason}`, `transfer_route {transfer, route, setting_up_direct?,
+why_not_direct?}` (§4.22), `apps_received {transfer, from, apps}` (§4.22), `settings_changed`,
+`notification`, `clipboard`.
+
+Every consent question (pairing, incoming files) is an event with an id; the UI answers
+with `respond(id, accept)`. Whichever front end answers first wins (desktop: the window
+or the notification).
+
+## 6. UX notes from the desktop app
+
+The owner found the first single-column design "too simplistic and non intuitive" and
+chose **device pages**: a list of devices, and per device a page with big actions and a
+history of everything shared with it. Mirror that on the phone:
+
+- **Device list** (home): paired devices with colored initials avatars and a presence
+  dot (Nearby / Connected / Not nearby), then "Nearby, not paired" with a Pair button,
+  and a prominent **Add Device** (QR scanner first on the phone).
+- **Receiving files** (desktop 0.9, [#32](https://github.com/LinkSy-mg/linksy-desktop/issues/32)):
+  no protocol change. Send a whole selection as **one** `offer` (§4.5), never one per file.
+  On the receiving side, offers from the same device within 1 second of the first are
+  asked about in one prompt ("3 items · 48 MB"), and its answer goes to all of them. The
+  prompt has **Accept**, **Always Accept** and **Decline**; Always Accept marks that
+  device, and its files are saved without asking from then on (a switch, **Always Accept
+  Files**, on its device page). Do the same on the phone.
+- **Device page**: big avatar, name, "Nearby · Linux laptop"; three big action buttons
+  **Send Files**, **Send Clipboard**, **Ping**; then **Activity** grouped by day (Today,
+  Yesterday, date), newest first. Rows: icon in a tinted circle (green incoming, accent
+  outgoing, red failed/declined), title (file name / "N items" / quoted clipboard text /
+  ping title), detail ("Received · 2.1 MB · 14:03", "Declined · …", or live
+  "81 MB of 400 MB · 38 MB/s · 8 seconds left" with a progress bar and cancel). Tap a
+  received file to open it; clipboard rows have "Copy again".
+- History is kept by the desktop service (`linksyd`), not by the core: the phone keeps
+  its own. Desktop keeps 500 entries and never writes clipboard text to disk (it may be a
+  password); do the same.
+
+Earlier notes, still valid:
+
+- On Android: the system **share sheet** ("Share → Linksy") is the main entry point;
+  the app shows nearby devices to pick from. A Quick Settings tile could send the
+  clipboard.
+- Pairing dialog shows the code large (`123 456`), with "Pair" / "Decline".
+- Incoming files: "<Device> Wants to Share", "N items · size", list of names, Accept /
+  Decline. Also as a notification with actions when the app isn't open.
+- Transfers show progress, speed and time left; finished incoming transfers open the
+  file or its folder.
+- Errors name the device in plain words: "Studio Desktop isn't reachable. Check that
+  it's on and on this network."
+- Settings: device name, save location, accept from paired devices automatically, stay
+  connected (off by default; explain it costs battery). The desktop also shows its own
+  address there, for "Pair by Address".
+- When no device is around, the empty state offers "Pair with QR Code" and "Pair by
+  Address" right there. On the phone: a big "Scan QR Code" button belongs in that state.
+- Screen windows fit the shared screen's shape (a phone's screen gets a tall, narrow
+  window, refitted on rotation), like iPhone Mirroring. A phone sharing its screen should
+  keep sending its real aspect ratio and orientation; don't letterbox on the phone side.
+- When the desktop uses the phone's camera, the desktop shows "Camera Is On · Click to
+  preview" with Preview / Stop. The phone side should show a matching persistent
+  "<desktop> is using your camera" notification with Stop.
+- An outgoing transfer says "Waiting for <device> to accept…" until the other side
+  answers, then shows progress.
+- Received files can be opened by tapping the finished transfer (desktop also allows
+  dragging them out).
+
+## 7. Open items affecting mobile
+
+- [ ] **Direct links phone to phone (§4.17 "Phone to phone").** Announce `direct_group` next
+      to `direct_host` and `direct_join` (Android 10+). Host on `DirectWanted { group: Some(g) }`:
+      `createGroup` with the Builder (name, passphrase, 5 GHz), then `invite` with the group
+      and its frequency, then `up`. Joiner on an `invite` with a group: `connect` with the
+      Builder, then `direct_dial` once connected and `up` arrived. `removeGroup` on
+      `DirectEnded` on both. `DirectWanted { group: None }` keeps the computer steps. Never log
+      the passphrase.
+- [ ] **Direct links, the host side (desktop 0.9.9, §4.17).** Announce `direct_host`,
+      then the Android steps in §4.17: `DirectWanted` → `invite`; `listening` → find the
+      computer, `connect` with group-owner intent 15 → `connecting`; group formed →
+      `up`; `DirectEnded` → `removeGroup`. Test with a 256 MiB file (or
+      `node.direct_link(id)`) and compare the speed with the computer's `--no-direct`.
+      Needs core ≥ this change (direct links, bigger socket buffers).
+- [ ] **The computer's volume (desktop 0.9.8, §4.5 "Volume").** For a computer with the
+      `volume` feature: `node.watch_volume(id, true)` while its player shows (with
+      `watch_media`), a slider and a mute button from `Event::VolumeState`, and
+      `node.set_volume(id, level, muted)` when they move (throttle a dragged slider to
+      about 10 a second). Bonus: the phone's volume buttons step the computer's volume
+      while that page is in front. Also mobile#15's ±10 s: already possible with
+      `media_command` `seek` to `position_ms` ± 10000 when `can_seek`.
+
+Phone-side fixes found testing with a realme 15 Pro 5G (2026-10-19):
+
+- [ ] **Screen video has black strips.** `ScreenShare.fit` rounds *both* sides down to a
+      multiple of 16 independently, so 1272×2800 becomes 864×1920 (0.450) for a 0.454
+      screen, and `VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR` letterboxes the difference inside
+      the video. Keep the exact aspect: pick the width (multiple of 16), then
+      `height = round(width × h / w)` rounded to an **even** number (H.264 needs even
+      sizes; encoders pad to 16 internally and signal the crop). Check
+      `MediaCodecInfo.VideoCapabilities.isSizeSupported(w, h)`, stepping the width down
+      by 16 until supported. The desktop window already fits the stream exactly.
+- [ ] **Answer unsupported kinds with `decline_unsupported`** (above), exposed through the
+      bridge, instead of `respond(false)` in `RustNode`.
+- [ ] **`control`: let the desktop drive the phone.** An `AccessibilityService`
+      (`canPerformGestures`) applies `pointer`/`button`/`scroll` messages with
+      `dispatchGesture`: `button left pressed` + `pointer` moves + `released` = one
+      stroke (tap if short and still, drag otherwise), `scroll` = a two-finger swipe,
+      `key` = `performGlobalAction` for Back/Home (keysyms Escape → back, Super/Home →
+      home) and text via `AccessibilityNodeInfo.ACTION_SET_TEXT` on the focused field.
+      The user enables the service once in Settings → Accessibility; until then answer
+      `control` with `decline_unsupported`.
+- [ ] **`display`: be the desktop's second screen.** Accept `display` requests (prompt
+      "fedora wants to use this screen as a second display"), go immersive full screen
+      in landscape, decode the stream with `MediaCodec` into a `SurfaceView`, and send
+      taps as `pointer` + `button left`, two-finger drags as smooth `scroll`. The desktop
+      currently sends 1920×1080; matching the phone's own size is planned.
+
+- [ ] Core: send from file descriptors / readers (for `content://` URIs).
+- [ ] Core: receive through a callback or into a caller-provided sink (MediaStore).
+- [x] Core: inject discovered devices from the platform (`device_found` / `device_lost`).
+- [x] QR pairing format and desktop side (§4.7). The phone side (scanner) is to build.
+- [ ] Phone showing a QR for a desktop to scan: no desktop camera flow planned; use the
+      phone as the scanner.
+- [x] Brand color: Signal.
+
+Found testing "Use as Second Display" on the realme (2026-10-20): the phone turned
+landscape but stayed black while GNOME had the extra monitor. The desktop's stream was
+fine (recorded with `fake_phone --display`, it decodes to the desktop's wallpaper), but
+x264 cut every frame into ~12 slices, and `DisplayReceiver` feeds MediaCodec one NAL unit
+per input buffer, each with its own timestamp, so the decoder never had a whole picture.
+Desktop 0.2.3 sends one slice per frame, which fixes it with today's receiver. To be
+robust against any encoder (GPU ones may slice too):
+
+- [ ] **Feed MediaCodec whole access units.** The desktop's stream has an access unit
+      delimiter (NAL type 9) before every frame: collect NALs until the next type 9 and
+      queue them as one buffer, one timestamp per access unit. Send SPS+PPS (types 7, 8)
+      together as one `BUFFER_FLAG_CODEC_CONFIG` buffer. Also set
+      `KEY_MAX_INPUT_SIZE` (e.g. 2 MiB) when configuring, so a big keyframe always fits.
+- [ ] **Use the phone's shape.** The virtual monitor is 1920×1080 today, letterboxed on a
+      2800×1272 screen. Proposal (needs a small core change, not done yet): the phone
+      reports its landscape size when accepting a `display` session and the desktop
+      creates the monitor at that size (scaled to fit 1080 px high).
+
+## Changelog
+
+- **2026-10-19** — Document created. Desktop has discovery, presence re-checks, pairing,
+  files/folders with resume, clipboard text, notifications, connect-on-demand with idle
+  close, stay-connected handshake flag, live settings (name, download folder,
+  auto-accept, stay connected), live rename (`renamed` message), pair by address.
+- **2026-10-19** — `Node::device_found` / `device_lost` for platform discovery. Fixed:
+  connecting on demand to a device with several addresses could fail (parallel `hello`s);
+  now only QUIC handshakes race (§4.6). After a rename, the old name's late mDNS goodbye
+  no longer hides the device. Desktop app: open/drag/clear received files.
+- **2026-10-19** — QR-code pairing (§4.7): `linksy://pair` invite links with a one-time
+  token, `invite` field in `hello`, desktop dialog and `linksy invite`.
+- **2026-10-19** — Desktop redesign to device pages with an activity timeline (§6), and
+  a history kept by the service. No protocol change.
+- **2026-10-19** — Brand palette chosen: Signal (§1).
+- **2026-10-19** — Screen mirroring (§4.8): `session_request`/`accept`/`decline` streams,
+  H.264 Constrained Baseline Annex-B, core `request_session` / `incoming_sessions`.
+- **2026-10-19** — Remote control (§4.8): session kind `control` and the input messages
+  (`pointer`, `button`, `scroll`, `key`); core `ControlMsg`, `control_frame`,
+  `read_control_frames`.
+- **2026-10-19** — Sidecar (§4.8): session kind `display`, where the requester shares a
+  virtual monitor and the receiver shows it full screen and sends input back.
+- **2026-10-19** — Phone as webcam, desktop side (§4.8): session kind `camera`; the
+  desktop publishes the stream as a PipeWire camera. Media: 720p30 Constrained Baseline.
+- **2026-10-19** — Desktop UX: screen windows fit the shared screen's shape; camera preview card. No protocol change.
+- **2026-10-19** — `session_decline` may carry `reason: "unsupported"`; core
+  `decline_unsupported`. Phone-side to-dos from real-device testing in §7 (screen aspect,
+  control via AccessibilityService, display mode).
+- **2026-10-20** — Desktop 0.1.1 ships as Flatpak, .deb and .rpm too. No protocol or core
+  API change; a phone sees a Flatpak desktop exactly like any other.
+- **2026-10-20** — Desktop app ID is now `mg.diary.linksy.Linksy` (site: linksy.diary.mg).
+  Nothing on the wire changes. If the phone app has no ID yet, `mg.diary.linksy` fits.
+- **2026-10-20** — `ROADMAP.md` lists the next features (0.2–0.5) with the phone-side
+  work for each. Nothing to build yet; protocol details land here as each one starts.
+- **2026-10-20** — **Open on PC** (desktop 0.2.0): `open_url` message (§4.5), core
+  `node.open_url(id, url)` and `Event::OpenUrl`. Phone to-do: an "Open on PC" target in
+  the Android share sheet for `text/plain` shares that are links (`ACTION_SEND`), with a
+  device picker when several computers are paired; plain text can go as `clipboard`.
+  The phone may also open links a computer sends (`Event::OpenUrl`), with a tap to confirm.
+- **2026-10-20** — **Battery & Ring** (desktop 0.2.1): `battery`, `ring`, `ring_stop`
+  (§4.5); core `send_battery`, `ring`, `DeviceView.battery`, `Event::Battery`,
+  `Event::Ring`. Phone to-do: listen to `ACTION_BATTERY_CHANGED` and send `battery` to
+  paired computers that are around (on connect, ±5 points, plug/unplug); on `ring`, play
+  the alarm at full volume even on silent with a full-screen "Found it" (stops on
+  `ring_stop` or after 30 s); a "Find my computer" button that sends `ring`. Test against
+  a desktop without the phone: `cargo run -p linksy-core --example fake_phone` acts as a
+  phone (see the file).
+- **2026-10-20** — **Phone notifications with reply** (desktop 0.2.2): `notification_posted`,
+  `notification_removed` (phone → computer), `notification_reply`, `notification_action`,
+  `notification_dismiss` (computer → phone), §4.5; core `post_notification`,
+  `remove_notification` and the matching events. Phone to-do: a
+  `NotificationListenerService` (onboarding explains and opens the special-access
+  setting); for each posted notification that isn't ongoing, a group summary, low
+  importance or Linksy's own, send `notification_posted` to paired computers that are
+  around (send `notification_removed` from `onNotificationRemoved`); answer replies via the
+  `RemoteInput` action, actions via their `PendingIntent`, dismissals via
+  `cancelNotification(key)`. A per-app on/off list on the phone is a nice extra. Test with
+  `fake_phone --notify "Alice" "Lunch?"` against a computer to see the desktop side.
+- **2026-10-20** — Desktop 0.2.3: x264 now sends one slice per frame (the black second
+  display on the realme). §7 has the receiver change that makes this robust.
+- **2026-10-20** — **Media controls** (desktop 0.3.0): `media_state`, `media_command`,
+  `media_watch` (§4.5) and their core calls. Phone to-do: with notification access
+  (already needed for notifications), `MediaSessionManager.getActiveSessions` +
+  `MediaController.Callback` give the phone's players: send `media_state` on changes,
+  act on `media_command` via `MediaController.transportControls`. For the computer's
+  players, a media-style notification ("Spotify on fedora") with play/pause/next, shown
+  while `media_watch` is on. Try it against a computer with
+  `fake_phone --media "Song" "Artist"` (appears in GNOME's media controls) and
+  `fake_phone --watch-media --press play-pause`.
+- **2026-10-20** — **Pause on calls** (desktop 0.3.1): `call_state` (§4.5), core
+  `send_call_state`. Phone to-do: `TelephonyCallback.CallStateListener`
+  (READ_PHONE_STATE) mapping RINGING → `ringing`, OFFHOOK → `active`, IDLE → `idle`;
+  include the contact's name only with contacts permission. Try with
+  `fake_phone --call 5` while something plays on the computer.
+- **2026-10-20** — **Lock when you walk away** (desktop 0.3.2): `heartbeat_watch`,
+  `heartbeat` (§4.5), core `heartbeat`, `watch_heartbeat`. Phone to-do: honor
+  `heartbeat_watch` with a foreground service (see §4.5 on Doze), one schedule per
+  computer. Test with `fake_phone --leave-after 30` and the switch on the phone's page
+  (the computer really locks; set `LINKSY_LOCK_COMMAND` on a test service to fake it).
+- **2026-10-20** — **Photo auto-import** (desktop 0.4.0): offers can carry
+  `"import": true` (§4.5); core `import_files`. The computer takes imports by default
+  (Preferences, "Import Photos From Phones"). Phone to-do: a setting per computer
+  ("Back up new photos to fedora"); watch `MediaStore` (images and videos) with a
+  `ContentObserver` or a periodic `WorkManager` job; when that computer is around and the
+  phone is on Wi-Fi (optionally only while charging), send what's new with
+  `import_files`, paths `YYYY-MM/<name>`; remember what went where so nothing is sent
+  twice (resume makes retries cheap). A declined import means that computer doesn't
+  want them: say so in the setting. Try with `fake_phone --import <folder>`.
+- **2026-10-20** — **Touchpad, keyboard and presentation remote** (desktop 0.4.1):
+  session kind `input` and `ControlMsg` `pointer_by` / `text` (§4.8). Phone to-do: a
+  "Remote" screen per computer: a touchpad area (one finger moves with `pointer_by`,
+  tap = left click, two-finger tap = right click, two fingers scroll), a keyboard button
+  that opens the IME and sends `text` (and `key` for Backspace/Enter), and a
+  presentation mode where volume down/up send Right/Left and the screen stays on.
+  Try with `fake_phone --touchpad` against a service started with `LINKSY_SCREEN_TEST=1`
+  (it logs the input instead of applying it).
+- **2026-10-20** — **Texting from the desktop** (desktop 0.5.0): `sms_*` messages (§4.5)
+  and their core calls. Phone to-do: READ_SMS, SEND_SMS, RECEIVE_SMS (and READ_CONTACTS
+  for names) behind an onboarding switch, since APKs from GitHub may ask for them;
+  answer `sms_list_threads` from `Telephony.Threads`/`Sms.Conversations`,
+  `sms_list_messages` from `Telephony.Sms` (MMS text parts are a bonus); `sms_send` via
+  `SmsManager.sendMultipartTextMessage` with a sent `PendingIntent` that answers
+  `sms_sent`; a `RECEIVE_SMS` receiver (or ContentObserver) pushes `sms_message`. Try it
+  against a computer: `fake_phone` answers with a made-up inbox, and the computer's
+  `linksy texts <phone>` / `linksy text <phone> <number> <message>` exercise the rest.
+- **2026-10-20** — **Phone in the Files sidebar** (desktop 0.5.1): `fs` request streams
+  (§4.9), core `node.fs()` / `node.incoming_fs()`. The computer mounts the phone as a
+  WebDAV place (GVfs) named after it, so it's in Files and every file dialog. Phone
+  to-do: a "Let <computer> browse my files" switch (off by default) that starts serving
+  `incoming_fs()`; `MANAGE_EXTERNAL_STORAGE` ("All files access") is the simplest for a
+  GitHub APK, or the storage access framework for chosen folders only; map `/` to shared
+  storage; answer reads with `RandomAccessFile` (videos seek); run it from the foreground
+  service while a computer has it open. Try against a computer with
+  `fake_phone --files <folder>` and its "Browse Files" row.
+- **2026-10-21** — `Config` has an `os` field (defaults to the build target, so "android"
+  on the phone with no change). Only the fake phone sets it.
+- **2026-10-21** — Desktop 0.5.3: "Finish Setup" installs what the computer lacks; with
+  v4l2loopback the phone's camera becomes a "Linksy Camera" V4L2 device that browsers and
+  Zoom list. Nothing changes for the phone.
+- **2026-10-21** — Read `docs/android-app.md`. Desktop 0.5.4: `DeviceInfo.features` (§4.10; the
+  phone can now send its list), the desktop hides Messages, Take Control, phone
+  notification settings and phone media for phones without them, and `fs` has an
+  optional `info` request whose `fs_info {name}` labels the Files bookmark
+  ("Pixel 9 (Documents)"). §2 now shows the phone's real status.
+- **2026-10-21** — Desktop 0.5.5: second display in the phone's shape: `session_accept`
+  may carry `width`/`height`, core `respond_session` (§4.8). `docs/android-app.md` §2.1 is done on
+  this side; the phone can send its size.
+- **2026-10-21** — Desktop 0.5.6, `docs/android-app.md` §2.3/§2.4: **images and files on the
+  clipboard**: offers may carry `"clipboard":true` (one file ≤ 10 MiB, §4.5), core
+  `send_clipboard_file`, `Event::ClipboardFile`; the computer's Send Clipboard sends a
+  copied image or file this way to devices with `clipboard_file`. **Clipboard watch**:
+  `{"type":"clipboard_watch","on":true}`, core `watch_clipboard`; while on, the computer
+  sends `clipboard` each time its clipboard text changes. Only where the desktop allows
+  it (KDE, wlroots; not GNOME), announced as the `clipboard_watch` feature: check it
+  before offering the setting. Phone to-do: announce `clipboard_file` once a received
+  `ClipboardFile` lands on the phone's clipboard (`ClipData` with a `content://` URI from
+  a FileProvider); its share sheet can send images this way. Try with
+  `fake_phone --clip-file <image>` and `fake_phone --watch-clipboard`.
+- **2026-10-21** — Desktop 0.5.7: **lower webcam latency** (the computer's decoder no
+  longer holds frames: about 400 ms less; phone-side tips in §4.8). **USB cable** (§4.11):
+  Android Open Accessory, manufacturer/model `Linksy`, QUIC packets framed as 2-byte
+  length + payload, a loopback connection wins over Wi-Fi; the phone needs the accessory
+  filter and the small UDP bridge. **Microphone** sessions (§4.8): raw 16-bit 48 kHz mono
+  PCM; announce `microphone`. From `docs/android-app.md`: **§2.8 camera controls** (the computer
+  sends `camera_control`; the phone sends `camera_state` with core `send_camera_state`)
+  and **§2.7 pictures** (`picture` message, base64 JPEG/PNG ≤ 128 KiB, sent after
+  connecting; the computer sends the user's account picture and shows the phone's as its
+  avatar). Try with `fake_phone --camera --picture <png>` and `linksy mic <device>`.
+- **2026-10-21** — Planned for 0.6 (nothing to build yet): §4.12 service information at
+  `https://linksy.diary.mg/linksy-relay` (relays, latest versions, protocol minimum,
+  notices), read at start-up and cached; the relay server is `../linksy-server`.
+- **2026-10-21** — Desktop 0.5.8: keep the screen on while showing a second display (§4.8;
+  it dropped after the screen timeout on a realme 15 Pro); the computer offers
+  "Reconnect" when a display drops. Desktop also checks `/linksy-relay` (§4.12) once a day
+  for updates now; the phone can do the same with `latest.android`.
+- **2026-10-21** — Desktop 0.5.9: 60 fps webcams (`docs/android-app.md` §2.8): the computer follows
+  `fps` from `camera_state` or its own `camera_control`, restarting its webcam device at
+  that rate in the same session; a "60 Frames per Second" switch in its camera settings.
+- **2026-10-21** — Desktop 0.6.0: 1080p webcams (§4.8): `camera_control {"size":[w,h]}`,
+  `camera_state` gains `size_options`; the computer follows `width`/`height`.
+- **2026-10-21** — Desktop 0.6.0: **away from home** (§4.13): iroh in the core carries
+  Linksy's QUIC between paired devices over the internet, through Linksy's relay when
+  needed; 7-day lease renewed on the same network or cable; screens, control, display,
+  camera, microphone, input and file browsing refused from away unless allowed per device
+  (`reason: "away"`); `Config.away`/`relay`, `Settings.away`, `DeviceInfo.away`,
+  `Link`, `DeviceView.away`/`away_all`/`away_until`. **Locate** (§4.14): `locate`,
+  `location`, `location_refused`. `Message` lost `Eq` (positions are floats).
+- **2026-10-21** — Desktop 0.6.1: `DeviceView.away_until` is `None` until the device's
+  away address is known (and while away from home is off), so "Reachable from away"
+  isn't shown before the two have met on the same network running 0.6. Phone: bump
+  the core and keep showing the line only when `away_until` is set; nothing else changes.
+- **2026-10-21** — Desktop 0.6.3: the screen viewer has a tip for Android phones (the
+  info button in its header): "Top bar black? … Developer options › Disable screen share
+  protections, then share again", answering docs/android-app.md §2.2. Desktop 0.6.2 redesigned
+  the device page; nothing changes in the protocol.
+- **2026-10-21** — §4.15 Terminal: the contract for a shell on the computer from the
+  phone (session `terminal`, a code set on the computer, `term_input`/`term_resize`/
+  `term_close`, detach and `resume`, `terminal_list`). Planned for desktop 0.7; spec
+  first so the phone can build its side. §2 status refreshed from phone 0.1.16. Desktop
+  0.6.4 saves received files to Downloads/Linksy, like the phone.
+- **2026-10-22** — Desktop 0.7.0: the terminal (§4.15) is built: reason `limit`, the
+  closing rules (`term_close` ends it, dropping the stream detaches, End on the computer
+  finishes the stream), `fake_phone --terminal` to test. Finish Setup also opens the
+  firewall (UDP 47200 and mDNS) on computers that have one.
+- **2026-10-22** — LinkSy-mg/linksy-releases has a new front page (README) for both apps:
+  Android downloads (the `/releases/latest/download/linksy*.apk` links, unchanged, so a
+  phone release needs no README edit), Linux downloads (between `<!-- linux:start -->`
+  and `<!-- linux:end -->`, rewritten by the desktop's release script), screenshots
+  (the phone ones are the website's), features, privacy. Please edit it in place rather
+  than replacing it, and keep "latest" on the APK releases.
+- **2026-10-22** — **Public releases renamed (please keep to this):** APKs carry their
+  version, `linksy-0.2.1.apk`, `linksy-0.2.1-arm64.apk`, `linksy-0.2.1-armv7.apk`, and
+  releases are titled **"Mobile release · Linksy X for Android"** (desktop ones "Desktop
+  release · Linksy X for Linux"). Every earlier release was renamed the same way, and
+  `tool/publish_public.sh` in linksy-mobile now uploads versioned names with that title.
+  The `/releases/latest/download/linksy.apk` links no longer exist: the newest APK is
+  **https://linksy.diary.mg/download/android** (also `android-arm64`, `android-armv7`),
+  which the website serves itself (downloads stalled at 99% from GitHub) under the
+  versioned name. The service information's `latest.android.download` points there.
+- **2026-10-22** — Desktop 0.8.0 (in progress): the app speaks the phone app's ten
+  languages (en, de, es, fr, it, ja, mg, pt, ru, zh), following the system or a choice in
+  Preferences; Connect by USB Cable guide and pairing over the cable (§4.11, phone items
+  there); the microphone card shows a live level with Listen and Stop; Finish Setup
+  installs through the system's own package tool in one password (KDE included), turns
+  on RPM Fusion for the camera driver, and walks through Secure Boot's approval.
+- **2026-10-22** — The desktop's translations (`crates/linksy-i18n/i18n/*.json`) now name
+  its own buttons and settings in each language. The Android strings that quote desktop
+  UI in English should use those names: e.g. fr « Tout autoriser à distance », « Importer
+  les photos des téléphones », « Préférences › Terminal » instead of « Allow Everything
+  From Away », « Import Photos From Phones », « Preferences › Terminal » (same in the
+  other languages; look the English up in the JSON files).
+- **2026-10-22** — USB cable tested on real hardware (realme 15 Pro 5G): computer side
+  works, phone app never opens the accessory. Details and what to check in §4.11.
+- **2026-10-22 10:58** — **Retested after the phone app update: still 0 packets.** Desktop
+  log: "Linksy over USB: realme 15 Pro 5G" (bridge open, phone in accessory mode
+  `18d1:2d00`), then "USB link: 0 packets from the phone, 0 to it". The user chose
+  Linksy on the phone. So the phone's node never dials through the bridge, or the bridge
+  never writes to the accessory. Please get logcat from the realme (wireless debugging
+  works while the cable is in accessory mode) and check, in order: the ATTACHED intent
+  arrives; `hasPermission`; `openAccessory` returns an fd; "usb cable: bridge on
+  127.0.0.1:P"; `connectAddress` is called and its error; the first `output.write`. The
+  desktop logs "USB link: first packet from the phone" as soon as one arrives.
+
+- **2026-10-22** — Desktop 0.8.3, nothing to change on the phone: a `control` request no
+  longer fails at once when the computer's remembered screen choice went stale (it asks
+  again); screen sharing works on GPUs whose low-power encoder can't keep a constant
+  bitrate (Intel Kaby Lake).
+
+- **2026-10-23** — Designs for 0.9, phone side to follow (desktop to come):
+  **private discovery** (§4.16: a 15-minute tag only paired devices recognise, a
+  `discovery_key` message on every connection, the §4.1 record only while a paired device
+  hasn't moved over, a pairing-mode record while adding a device), and **the cable when
+  you ask for it** (§4.11: no prompt on plug-in, `usb_plugged` and `usb_connect`,
+  "Connect by USB Cable" on the computer's page in the app). Nothing changes for the phone
+  until it implements them; an upgraded computer still finds and is found by today's app.
+
+- **2026-10-23** — Desktop 0.8.7: plugging a phone in no longer asks anything (§4.11).
+  The computer's guide connects it, and a per-phone "use the cable automatically" switch
+  (off by default) brings back switching on plug-in. `usb_plugged` / `usb_connect` for the
+  phone's own button come in 0.9; nothing to change on the phone yet.
+- **2026-10-24** — Private discovery (§4.16) implemented on the desktop for 0.9: the
+  `discovery_key` message on every connection to a paired device, the 15-minute tag
+  record (HMAC-SHA256, test vector added), the pairing record while the invite dialog is
+  open, and the §4.1 record only while a paired device hasn't sent its key. Forgetting a
+  device sends the new key to connected devices at once. Phone: send `discovery_key`,
+  store the computer's, look for its tag, and announce the same records.
+- **2026-10-24** — Desktop 0.9: one prompt for offers from a device that arrive together,
+  and **Always Accept** per device (§6, "Receiving files"). No protocol change; the phone
+  should send a selection as one offer and mirror the prompt.
+- **2026-10-24** — Desktop 0.9: `usb_plugged` and `usb_connect` (§4.11) implemented. Phone:
+  show Connect by USB Cable on the computer's page as described there.
+- **2026-10-24** — Desktop 0.9.6: on KDE a `display` comes at the desktop's own size, not the
+  one in `session_accept` (§4.8); the phone fits it to its screen.
+- **2026-10-24** — Desktop 0.9.8: the computer's volume (§4.5 "Volume"): `volume_watch`,
+  `volume_state`, `volume_set`, feature `volume` (§4.10), core `watch_volume`,
+  `set_volume`, `send_volume_state` and `Event::VolumeState` / `VolumeSet` / `VolumeWatch`.
+  Phone to-do in §7.
+- **2026-10-24** — Core (after b5a9739): a picked file sent through a link to
+  `/proc/self/fd/N` is read at its own offsets, so the descriptor's position (the app's,
+  or another transfer's of the same file) never moves; and only while N still holds the
+  file that was offered (device and inode): if it was closed and the number reused, the
+  transfer fails with "… isn't the file that was offered any more" instead of sending
+  another file. Keep the descriptor open until the transfer ends.
+- **2026-10-24** — Core and desktop 0.9.9: **direct links** (§4.17). Wi-Fi Direct between a
+  phone (host, `direct_host`) and a computer (joiner, `direct_join`, NetworkManager) for
+  transfers of 256 MiB or more: `direct` messages (`ask`, `invite`, `listening`,
+  `connecting`, `up`, `end`), handshake `intent: direct` for a second connection, core
+  `direct_send` / `direct_dial` / `direct_end` / `direct_link`, `Config.direct_min`, and
+  `Event::DirectWanted` / `Direct` / `DirectLinked` / `DirectEnded`. Also: the QUIC socket
+  asks for 8 MiB kernel buffers (§4.3). Phone to-do in §7.
+- **2026-10-25** — First direct link test (realme 15 Pro): the phone's part worked, but the
+  computer looked for `02:00:00:00:00:00`, the address Android gives apps for their own
+  device, and never found it. `invite` now carries the host's Wi-Fi Direct `name`; the
+  joiner finds the host by address, else by that name (or its Linksy name), only when one
+  device has it. Phone: send `name`, and on `DirectEnded` also `cancelConnect` (§4.17).
+- **2026-10-25** — Second test: the link came up (5180 MHz, 192.168.49.x) after 25 s, the
+  moment the old limit ran out: 16 s to find each other, 9 to connect. The limit is
+  **45 s** now (core ≥ the commit after 103ae0a); the phone needs it too, its own timer ends
+  the attempt as well.
+- **2026-10-25** — Third test: **79 MB/s** over the direct link (1.97 GB in 25 s, phone →
+  computer, 5180 MHz), up 15 s after the invite (12 s for the phone to find the computer).
+  But the link closed 20 to 25 s after it came up, mid-transfer ("connection lost"; the
+  partial file resumes). Not the phone: the **receiving core** closed it as idle, because
+  an incoming transfer runs in a task of its own and the link stopped counting it once
+  that task started (fixed in core, with a test). Also: asking for a link that's up
+  (`direct_link`, an `ask`) keeps it, and a link that closes logs why.
+  `Config.direct_idle` (default 20 s) sets how long an idle link stays.
+- **2026-10-25** — Core: **direct links phone to phone** (§4.17 "Phone to phone"). Feature
+  `direct_group`; `invite` may carry `group { ssid, passphrase, frequency }`, generated by
+  the core in `Event::DirectWanted { id, group }` when both have `direct_group`; the joiner
+  joins with Android's `WifiP2pConfig.Builder`, no `listening`/`connecting`. When both
+  could host, the smaller id hosts. Phone to computer is unchanged.
+- **2026-10-25** — Discovery (§4.16 "Browse again at each epoch"): the desktop starts a
+  fresh mDNS browse 5 s after each epoch boundary and 1 s after a paired device's record
+  goes, so a missed new record no longer leaves the device "not nearby" for up to an hour
+  (desktop#50). The presence check no longer stops for good after one failed query.
+- **2026-10-25** — Desktop: **Always Allow** for `screen`, `control` and `input` (§4.8,
+  desktop#49). No protocol change: a local choice per device, `set_allow_screen` in the
+  core, never from away. Phone: the same button is optional when a computer asks to see
+  the phone's screen (`screen`); the core already skips the prompt once it's set.
+- **2026-10-26** — **Choose the screen again** (§4.8, desktop#15): optional `"choose": true`
+  in a `screen` or `control` `session_request`; the computer forgets the screen its user
+  picked last time and shows the desktop's dialog again. Core: `request_session_choosing`,
+  `Session.choose`. Phone: a **Choose Screen** action on a computer's screen viewer.
+- **2026-10-26** — Desktop: while a shared screen is still, the computer repeats its last frame
+  every 100 ms (§4.8). Encoders keep one frame back until the next, so a tap's cursor used to
+  show up to a second late. No protocol change; a viewer sees at least 10 frames a second.
+- **2026-10-29** — Desktop 0.10.0: `screen`, `control` and `input` work on X11 desktops with
+  no portal (the helper reads the display and drives it with XTest); `display` is refused
+  there with a reason. The Flatpak announces `terminal` (§4.15) and does everything the
+  packages do. No protocol change; a phone needs nothing new.
+- **2026-10-30** — Desktop 0.10.0: on Hyprland and Sway, `control`, `input` and `display`
+  apply the phone's input through the compositor's virtual pointer and keyboard (their
+  portals have no RemoteDesktop). A second display there now takes taps. No protocol change.
+- **2026-10-31** — Desktop 0.11 (in progress): the cable's framing version 2 (§4.11:
+  hello, keepalives, close; `linksy_core::cable::phone_bridge` for the phone, reading 16 KB
+  at a time), the accessory's version string `2`, and controlling a phone over the cable
+  through Android Open Accessory 2.0's virtual touchscreen and keyboard, with no phone
+  change. `ControlMsg::Key` gains an optional `code` (the physical key, evdev); older
+  devices ignore it.
+- **2026-11-01** — Desktop 0.11.3: Away From Home turned off closes the endpoint at once,
+  and `linksy-core`'s new default feature `away` can leave iroh out of a build (§4.13). No
+  protocol change.
+- **2026-11-02** — Plan: 0.11 is the phone's notifications through a listener in the Linksy
+  app itself (§4.5, phone to-do); the separate "Extras" app is dropped. No protocol change.
+- **2026-11-02** — Desktop 0.11.4: a **Messages** page made from the phone's message
+  notifications, verification codes copied (§4.5 Messages). `notification_posted` gains
+  optional `category`, `conversation`, `sender`, `group`, `time` and `picture`; older
+  devices ignore them. Phone to-do: fill them from `MessagingStyle`, and send the launcher
+  icon at 96 px.
+- **2026-11-02** — Core (in desktop 0.11.4): `Node::set_features` changes the features while running; connected
+  devices hear a new `features` message (§4.5, §4.10), so `notifications` can be announced
+  when the listener is turned on. Older desktops ignore it until they reconnect.
+- **2026-11-02** — Desktop 0.12.1: the device page in tabs; Inbox with the phone's
+  other notifications, `messages` history, `subject`, `reply_kept` and `inbox_history`
+  pages (§4.5); Gallery (§4.18); Deck (§4.19); `DeviceView.latency_ms`. Phone to-do: the
+  optional Inbox fields, `gallery` and the deck. Older devices ignore all of it.
+- **2026-11-02** — Desktop 0.12.1: the Files tab is a file manager for the phone
+  (copy both ways, new folder, rename, delete) over the existing `fs` ops (§4.9), several
+  requests at once; the deck drops `system.screen_off`. Phone to-do: answer `fs` streams
+  concurrently.
+- **2026-11-02** — `notification_posted` gains optional `mine` (§4.5): the newest message
+  is the user's own. Phone to-do: send it, and keep `conversation` the chat's name.
+- **2026-11-02** — Deck layouts (§4.20), desktop 0.12.1: the computer keeps each
+  phone's layouts from its editor and sends them as `deck_layout` on `deck_open` and on
+  every save, only to a phone with feature `deck_layout`. Core: `Event::DeckLayout`,
+  `DeckLayouts`. A message over 1 MiB now fails when sent instead of at the other side.
+  Phone to-do: announce `deck_layout`, draw the layouts and themes, keep the last ones.
+- **2026-11-02** — Deck actions (§4.19), desktop 0.12.1: `sound.output`,
+  `system.dnd`, `system.restart`, `system.shutdown`, `network.wifi`, `network.bluetooth`,
+  `network.airplane`, `power.saver`, `power.balanced`, `power.performance`, `power.auto`,
+  in new groups `Network` and `Power`; `deck_actions` entries gain optional `confirm`,
+  `deck_state` entries optional `text`. The deck keeps the screen on and dims it after
+  60 s untouched (§4.20). Phone to-do: ask `confirm` before running, show `text`, the
+  screen rule.
+- **2026-11-03** — USB (§4.11), desktop 0.12.1: a cable pulled out closes the phone's
+  connection through it at once. The computer also recognizes a phone on the cable by its
+  bridge port again (the address came as `::ffff:127.0.0.1`), and drives only that phone:
+  with another Android phone paired, it no longer guesses that the one plugged in is the
+  one being viewed. Phone to-do: on unplug, drop the cable connection and dial over Wi-Fi
+  straight away (linksy-mobile#20).
+- **2026-11-04** — **Turn on** (§4.21), desktop after 0.12.4: the Inbox and Gallery tabs
+  show while off, with what to turn on and a help link; `turn_on` (computer → phone,
+  `notifications` or `gallery`), feature `turn_on`, core `ask_turn_on` and
+  `Event::TurnOnRequest`. Phone to-do: announce `turn_on` and ask the user, as in §4.21;
+  offer both in first-run setup, and turn the Inbox on once notification access is given.
+- **2026-11-05** — **Phone to phone** (§4.22), desktop after 0.12.4: every transfer tells both
+  ends its route (`transfer_route`: cable, direct link, same network, internet), also while a
+  direct link is being set up; the core learns how fast each route to a device is and sets
+  up a direct link when that gets the bytes there sooner, `plan_send` says what a send would
+  do and `prepare_send` brings a link up while the user is still choosing (a new direct
+  step, `keep`); `preflight` asks a device for its room, whether it asks first, whether a
+  direct link would work and which apps it has before anything is sent; apps travel as
+  folders of APKs in an offer, with `apps` describing them, `send_bundle` to send and
+  `apps_received` to install; offers that would fill the disk are declined at once with the
+  room said. Features `preflight` (computers too) and `apps`. Phone to-do: §4.22.

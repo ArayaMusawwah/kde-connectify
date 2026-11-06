@@ -1,0 +1,370 @@
+//! linksyd: the always-on Linksy service. Keeps paired devices connected, receives files,
+//! and shows native notifications. Front ends (the app, the `linksy` CLI) talk to it over
+//! a Unix socket and can come and go.
+
+mod clipboard;
+mod commands;
+mod codes;
+#[cfg(target_os = "linux")]
+mod controls;
+#[cfg(target_os = "linux")]
+mod deck;
+mod gallery;
+mod history;
+mod inbox;
+mod ipc;
+mod links;
+mod lock;
+mod mirror;
+#[cfg(target_os = "linux")]
+mod network;
+mod phone_files;
+mod photos;
+mod pictures;
+#[cfg(target_os = "linux")]
+mod rest;
+mod update;
+mod sessions;
+mod supervise;
+#[cfg(target_os = "linux")]
+mod terminal;
+// Accept/Decline buttons need the freedesktop notification spec; other platforms get
+// their own native notifications with their apps.
+#[cfg(target_os = "linux")]
+mod dav;
+#[cfg(target_os = "linux")]
+mod file_managers;
+#[cfg(target_os = "linux")]
+mod direct;
+#[cfg(target_os = "linux")]
+mod media;
+#[cfg(target_os = "linux")]
+mod notify;
+mod single;
+mod system;
+#[cfg(target_os = "linux")]
+mod tray;
+#[cfg(target_os = "linux")]
+mod usb;
+mod usb_hid;
+#[cfg(target_os = "linux")]
+mod volume;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use linksy_core::{Config, Node};
+use tracing::{error, info};
+
+/// Asked to stop (`linksy_ipc::Request::Quit`).
+pub static QUIT: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// What a Linux computer running Linksy can do for other devices.
+const FEATURES: &[&str] = &[
+    "files", "clipboard", "open_url", "ring", "battery", "media_state", "media_remote", "call_state", "heartbeat",
+    "import", "fs", "input", "screen", "control", "display", "camera", "watch", "notifications", "sms",
+    "clipboard_file", "microphone", "picture", "deck", "preflight",
+];
+
+/// Fixed default port so a peer's last known address stays valid across restarts.
+const DEFAULT_PORT: u16 = 47_200;
+
+struct Args {
+    config: Config,
+    socket: PathBuf,
+    notifications: bool,
+    open_links: bool,
+    usb: bool,
+    direct: bool,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut config = Config::new(system::data_dir(), system::download_dir(), system::device_name());
+    config.kind = system::device_kind();
+    // Everything this computer does for its devices (docs/protocol.md §4.10).
+    config.features = FEATURES.iter().map(|f| f.to_string()).collect();
+    if clipboard::can_watch() {
+        config.features.push("clipboard_watch".into());
+    }
+    if cfg!(target_os = "linux") {
+        config.features.push("terminal".into());
+    }
+    #[cfg(target_os = "linux")]
+    if volume::available() {
+        config.features.push("volume".into());
+    }
+    config.port = DEFAULT_PORT;
+    let mut socket = linksy_ipc::socket_path();
+    let mut notifications = true;
+    let mut open_links = true;
+    let mut usb = true;
+    let mut direct = true;
+    let mut away = true;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
+        match a.as_str() {
+            "--name" => config.name = value("--name")?,
+            "--port" => config.port = value("--port")?.parse().map_err(|_| "--port needs a number")?,
+            "--data-dir" => {
+                config.data_dir = value("--data-dir")?.into();
+                config.keep_data_dir_mode = true;
+            }
+            "--download-dir" => config.download_dir = value("--download-dir")?.into(),
+            "--socket" => socket = value("--socket")?.into(),
+            "--no-discovery" => config.discovery = false,
+            "--stay-connected" => config.stay_connected = true,
+            "--no-notifications" => notifications = false,
+            "--no-open-links" => open_links = false,
+            "--no-usb" => usb = false,
+            "--no-direct" => direct = false,
+            "--no-away" => away = false,
+            "-h" | "--help" => {
+                println!(
+                    "linksyd — Linksy background service\n\n\
+                     Options:\n  --name NAME          device name shown to others\n  \
+                     --port PORT          UDP port (default {DEFAULT_PORT})\n  \
+                     --data-dir DIR       identity and paired devices\n  \
+                     --download-dir DIR   where received files go\n  \
+                     --socket PATH        IPC socket\n  \
+                     --no-discovery       don't advertise or browse the network\n  \
+                     --stay-connected     keep paired devices connected (default: on demand)\n  \
+                     --no-notifications   don't show desktop notifications\n  \
+                     --no-open-links      don't open links devices send (they're still in the history)\n  \
+                     --no-usb             don't connect phones over USB cables\n  \
+                     --no-direct          don't join phones' Wi-Fi Direct links for big transfers\n  \
+                     --no-away            don't reach devices away from home (over the internet)"
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    // Settings are saved as absolute paths; resolve relative arguments against the cwd.
+    for dir in [&mut config.data_dir, &mut config.download_dir] {
+        *dir = std::path::absolute(&*dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    // Away from home, through the relay the website lists (docs/protocol.md §4.13).
+    config.away = away;
+    config.relay = Some(update::relay(&config.data_dir.join("update.json")));
+    Ok(Args { config, socket, notifications, open_links, usb, direct })
+}
+
+fn main() -> ExitCode {
+    // Where nothing else restarts the service, this process only watches it (see supervise.rs)
+    if let Some(code) = supervise::run() {
+        return code;
+    }
+    // Two malloc arenas, not one per thread: set before any thread starts (desktop#26)
+    // SAFETY: no other thread is running yet
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+    tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime").block_on(run())
+}
+
+async fn run() -> ExitCode {
+    linksy_logs::catch_crashes("linksyd", env!("CARGO_PKG_VERSION"));
+    // The Flatpak's service has no journal: its output (and its screen helper's) goes to a
+    // file of its own, for Save Logs
+    #[cfg(unix)]
+    if std::env::var_os("FLATPAK_ID").is_some()
+        && let Ok(file) = linksy_logs::open_service_log()
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: replacing this process's stdout and stderr with an open file, before any
+        // thread writes to them
+        unsafe {
+            libc::dup2(file.as_raw_fd(), 1);
+            libc::dup2(file.as_raw_fd(), 2);
+        }
+    }
+    let level = std::env::var("LINKSY_LOG").ok().and_then(|l| l.parse().ok()).unwrap_or(tracing::Level::INFO);
+    // Colors only for a terminal: not in the journal or the Flatpak's log file
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    tracing_subscriber::fmt().with_max_level(level).with_target(false).with_ansi(ansi).init();
+
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("linksyd: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // One service per user. The lock decides, held until this ends: two started together both
+    // find no socket yet. A socket that answers is an older linksyd, which took no lock.
+    let _single = match single::take(&args.socket) {
+        Ok(lock) => lock,
+        Err(single::Taken) => {
+            eprintln!("linksyd is already running");
+            return ExitCode::SUCCESS;
+        }
+    };
+    if tokio::net::UnixStream::connect(&args.socket).await.is_ok() {
+        eprintln!("linksyd is already running");
+        return ExitCode::SUCCESS;
+    }
+    let _ = std::fs::remove_file(&args.socket);
+
+    let mut config = args.config;
+    // Big transfers over a phone's Wi-Fi Direct link (docs/protocol.md §4.17)
+    #[cfg(target_os = "linux")]
+    if args.direct && direct::available().await {
+        config.features.push("direct_join".into());
+    }
+    let data_dir = config.data_dir.clone();
+    let node = match Node::start(config.clone()).await {
+        Ok(n) => n,
+        // The fixed port is taken (another app, or a second user): fall back to any port.
+        Err(e) if config.port != 0 => {
+            info!("port {} unavailable ({e}), using a random port", config.port);
+            config.port = 0;
+            match Node::start(config).await {
+                Ok(n) => n,
+                Err(e) => {
+                    error!("could not start: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Err(e) => {
+            error!("could not start: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    info!("{} ({}) ready, saving files to {}", node.info().name, node.info().id.short(), node.settings().download_dir.display());
+
+    #[cfg(target_os = "linux")]
+    if args.notifications {
+        tokio::spawn(notify::run(node.clone()));
+    }
+    tokio::spawn(clipboard::run(node.clone(), args.notifications));
+    if args.open_links {
+        tokio::spawn(links::run(node.clone()));
+    }
+    let history = history::History::load(data_dir.join("history.json"));
+    tokio::spawn(history.clone().run(node.clone()));
+    let _ = phone_files::FILES.set(phone_files::PhoneFiles::new(node.clone(), history.clone()));
+    #[cfg(target_os = "linux")]
+    tokio::spawn(rest::run());
+    #[cfg(target_os = "linux")]
+    tokio::spawn(network::run(node.clone()));
+    let socket = args.socket.clone();
+    let sessions = sessions::Sessions::new(data_dir.clone(), socket.clone());
+    tokio::spawn(sessions.clone().run(node.clone()));
+    tokio::spawn(sessions.clone().watch_cameras(node.clone()));
+    tokio::spawn(pictures::run(node.clone(), data_dir.clone()));
+    let updates = update::UPDATES.get_or_init(|| update::Updates::load(data_dir.join("update.json"), args.notifications)).clone();
+    tokio::spawn(updates.run());
+    let icons = linksy_ipc::runtime_dir().unwrap_or_else(std::env::temp_dir).join("linksy-icons");
+    #[cfg(target_os = "linux")]
+    tokio::spawn(media::run(node.clone(), icons.join("art")));
+    #[cfg(target_os = "linux")]
+    tokio::spawn(volume::run(node.clone()));
+    #[cfg(target_os = "linux")]
+    {
+        let deck = deck::Deck::load(data_dir.join("deck.json"), deck::System::default());
+        let _ = deck::DECK.set(deck.clone());
+        tokio::spawn(deck.run(node.clone()));
+    }
+    #[cfg(target_os = "linux")]
+    if node.info().features.iter().any(|f| f == "direct_join") {
+        tokio::spawn(direct::run(node.clone()));
+    }
+    let _ = gallery::GALLERY.set(gallery::Gallery::new(icons.with_file_name("linksy-thumbs")));
+    let mirror = mirror::Mirror::load(data_dir.join("notifications.json"), icons, socket.clone(), args.notifications);
+    tokio::spawn(mirror.clone().run(node.clone()));
+    #[cfg(target_os = "linux")]
+    let _ = dav::BRIDGES.set(dav::Bridges::start(data_dir.join("files.json"), node.clone()).await);
+    #[cfg(target_os = "linux")]
+    if args.usb {
+        let usb = usb::Usb::new(node.clone(), data_dir.clone());
+        let _ = usb::USB.set(usb.clone());
+        tokio::spawn(usb.run());
+    }
+    // Terminals for phones (from the Flatpak, the computer's own shell: linksy-host)
+    #[cfg(target_os = "linux")]
+    {
+        let terminals = terminal::Terminals::load(&data_dir);
+        let _ = terminal::TERMINALS.set(terminals.clone());
+        tokio::spawn(terminals.run(node.clone()));
+    }
+    let photos = photos::Photos::load(data_dir.join("photos.json"), &node);
+    let commands = commands::Commands::load(&data_dir);
+    let commands_for_ipc = commands.clone();
+    tokio::spawn(commands.run(node.clone()));
+    // From the Flatpak: Send with Linksy in the file managers here
+    #[cfg(target_os = "linux")]
+    if linksy_host::flatpak() {
+        tokio::task::spawn_blocking(file_managers::install);
+    }
+    let away = lock::Away::load(data_dir.join("lock.json"));
+    tokio::spawn(away.clone().run(node.clone(), history.clone()));
+    #[cfg(target_os = "linux")]
+    tokio::spawn(tray::run(tray::Service {
+        node: node.clone(),
+        history: history.clone(),
+        sessions: sessions.clone(),
+        mirror: mirror.clone(),
+        away: away.clone(),
+        photos: photos.clone(),
+        commands: commands_for_ipc.clone(),
+        socket: socket.clone(),
+    }));
+    let server = tokio::spawn(ipc::serve(node.clone(), history, sessions, mirror, away, photos, commands_for_ipc, socket.clone()));
+
+    let mut updated = None;
+    tokio::select! {
+        r = server => if let Ok(Err(e)) = r { error!("IPC server stopped: {e}") },
+        _ = shutdown_signal() => info!("shutting down"),
+        _ = QUIT.notified() => info!("asked to quit"),
+        exe = replaced() => {
+            info!("Linksy was updated, restarting");
+            updated = Some(exe);
+        }
+    }
+    // Shells don't outlive the service that runs them.
+    #[cfg(target_os = "linux")]
+    if let Some(t) = terminal::TERMINALS.get() {
+        t.end_all();
+    }
+    // Never lingers: a service that lost the relay's one place for its id (a second copy) used
+    // to hang here and stay in the tray
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), node.shutdown()).await;
+    let _ = std::fs::remove_file(&socket);
+    if let Some(exe) = updated {
+        use std::os::unix::process::CommandExt;
+        let e = std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec();
+        error!("could not start the new version: {e}");
+        return ExitCode::FAILURE;
+    }
+    // Notifications still on screen each have a thread waiting for a click, which would
+    // keep the runtime (and so the process) alive; everything that matters is done.
+    std::process::exit(0)
+}
+
+/// Resolves with this program's path once a package update has replaced it (the running
+/// one then shows as deleted), so the new version takes over without a log-out.
+async fn replaced() -> PathBuf {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let Ok(exe) = std::fs::read_link("/proc/self/exe") else { continue };
+        if let Some(path) = exe.to_str().and_then(|p| p.strip_suffix(" (deleted)"))
+            && std::fs::metadata(path).is_ok()
+        {
+            return path.into();
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}

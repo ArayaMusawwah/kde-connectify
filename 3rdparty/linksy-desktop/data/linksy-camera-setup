@@ -1,0 +1,110 @@
+#!/bin/sh
+# Give this computer a "Linksy Camera" video device, now and at every boot, so a phone's
+# camera shows up in every app (browsers and Zoom only list V4L2 cameras). Run as root:
+# Linksy starts it with pkexec from its Finish Setup dialog. Needs v4l2loopback.
+# Exit codes: 0 done, 3 driver missing, 4 driver waits for Secure Boot's approval at the
+# next restart (a line "ENROLL <code>" when there's a code to type then).
+set -u
+NAME="Linksy Camera"
+
+have_device() {
+  for n in /sys/class/video4linux/*/name; do
+    [ -r "$n" ] && [ "$(cat "$n")" = "$NAME" ] && return 0
+  done
+  return 1
+}
+
+if ! modinfo v4l2loopback >/dev/null 2>&1; then
+  echo "v4l2loopback isn't installed" >&2
+  exit 3
+fi
+# Some kernels bring the driver but not the tool that adds a device (CachyOS)
+if ! command -v v4l2loopback-ctl >/dev/null; then
+  echo "v4l2loopback-ctl is missing: install v4l2loopback-utils (v4l2loopback on Fedora)" >&2
+  exit 3
+fi
+
+# At every boot first: when the driver waits for a restart, the camera is there after it.
+# Without systemd (Artix, Void, Gentoo: desktop#54), the init loads the drivers listed in
+# modules-load.d, and these options make the driver bring our camera as it loads.
+if [ ! -d /run/systemd/system ]; then
+  mkdir -p /etc/modules-load.d /etc/modprobe.d
+  echo v4l2loopback > /etc/modules-load.d/linksy-camera.conf
+  echo 'options v4l2loopback devices=1 card_label="Linksy Camera" exclusive_caps=1 max_width=1920 max_height=1920' > /etc/modprobe.d/linksy-camera.conf
+else
+cat > /etc/systemd/system/linksy-camera.service <<'EOF'
+[Unit]
+Description=Linksy Camera (a phone's camera as a webcam in every app)
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '[ -d /sys/module/v4l2loopback ] || modprobe v4l2loopback devices=0; grep -qx "Linksy Camera" /sys/class/video4linux/*/name 2>/dev/null || v4l2loopback-ctl add --name "Linksy Camera" --exclusive-caps 1 --max-width 1920 --max-height 1920'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable linksy-camera.service >/dev/null 2>&1
+fi
+
+# Secure Boot refuses a driver built here until its key is approved, once, in the blue
+# screen at the next restart (MOK). Ask for that with a short code to type there.
+enroll() {
+  for key in /etc/pki/akmods/certs/public_key.der /var/lib/dkms/mok.pub /var/lib/shim-signed/mok/MOK.der; do
+    [ -f "$key" ] || continue
+    if ! command -v mokutil >/dev/null; then
+      echo "Secure Boot needs the camera driver approved: install mokutil, then try again" >&2
+      exit 1
+    fi
+    mokutil --test-key "$key" 2>&1 | grep -q "already enrolled" && return 0
+    # Asked before and not restarted since: ask again, with a new code to show.
+    mokutil --list-new 2>/dev/null | grep -q . && mokutil --revoke-import >/dev/null 2>&1
+    code=$(tr -dc 0-9 < /dev/urandom | head -c 8)
+    hash=$(mktemp)
+    mokutil --generate-hash="$code" > "$hash" && mokutil --import "$key" --hash-file "$hash" >/dev/null 2>&1 && echo "ENROLL $code"
+    rm -f "$hash"
+    return 0
+  done
+}
+
+# Loaded by someone else (OBS) keeps their options; otherwise load it with no devices of
+# its own, and add ours.
+# The akmods key is approved, yet the driver is refused: it was built before that key
+# existed, or with another one. Build it again, signed with the approved key.
+resign() {
+  key=/etc/pki/akmods/certs/public_key.der
+  [ -f "$key" ] && command -v akmods >/dev/null && command -v mokutil >/dev/null || return 1
+  mokutil --test-key "$key" 2>&1 | grep -q "already enrolled" || return 1
+  echo "STEP Building the camera driver again, signed with the approved key"
+  # --rebuild, not --force: --force keeps a driver that's already installed (#43)
+  if ! akmods --rebuild --kernels "$(uname -r)" --akmod v4l2loopback >/dev/null 2>&1; then
+    echo "building the camera driver failed: see /var/cache/akmods/v4l2loopback/.last.log" >&2
+    exit 1
+  fi
+  depmod -a "$(uname -r)"
+  out=$(modprobe v4l2loopback devices=0 2>&1) && return 0
+  # Still refused, and a restart won't change it: say why instead of asking for one
+  echo "$out" >&2
+  [ -n "$(modinfo -F signer v4l2loopback 2>/dev/null)" ] || echo "the camera driver was built without a signature: /etc/pki/akmods/private/private_key.priv is missing" >&2
+  exit 1
+}
+
+if [ ! -d /sys/module/v4l2loopback ]; then
+  if ! out=$(modprobe v4l2loopback devices=0 2>&1); then
+    case "$out" in
+      *"Key was rejected"*|*"Required key not available"*)
+        if ! resign; then
+          echo "$out" >&2
+          enroll
+          exit 4
+        fi ;;
+      *) echo "$out" >&2; exit 1 ;;
+    esac
+  fi
+fi
+if ! have_device; then
+  v4l2loopback-ctl add --name "$NAME" --exclusive-caps 1 --max-width 1920 --max-height 1920 >/dev/null || exit 1
+fi
+echo "Linksy Camera is ready"

@@ -1,0 +1,98 @@
+app-id: mg.diary.linksy.Linksy
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: linksy-app
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # This computer's camera, for a device that uses it as a webcam (V4L2 has no portal yet).
+  - --device=all
+  # Received files land in Downloads/Linksy.
+  - --filesystem=xdg-download
+  # Photos imported from phones land in Pictures.
+  - --filesystem=xdg-pictures
+  # "Use as Webcam": a phone's camera is published as a PipeWire camera for other apps.
+  - --filesystem=xdg-run/pipewire-0
+  # The service's notifications: incoming files, pings, pairing codes, with actions.
+  - --talk-name=org.freedesktop.Notifications
+  # Media controls both ways: this computer's players for the phone, the phone's in GNOME.
+  - --talk-name=org.mpris.MediaPlayer2.*
+  - --own-name=org.mpris.MediaPlayer2.Linksy.*
+  # A phone in the Files sidebar: mount it with GVfs and open it.
+  - --talk-name=org.gtk.vfs.*
+  - --talk-name=org.freedesktop.FileManager1
+  # Lock when you walk away (it only ever locks).
+  - --talk-name=org.gnome.ScreenSaver
+  - --talk-name=org.freedesktop.ScreenSaver
+  # The tray icon, on desktops that show one.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Big transfers over a phone's Wi-Fi Direct link, joined with NetworkManager.
+  - --system-talk-name=org.freedesktop.NetworkManager
+  # What the packages do outside a sandbox, through flatpak-spawn --host: the terminal for
+  # phones, Finish Setup (the camera driver, the USB cable, the firewall, with the
+  # computer's own password prompt), starting at login, Update Now, Send with Linksy in
+  # file managers, and the screen lockers and outputs of tiling desktops.
+  - --talk-name=org.freedesktop.Flatpak
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+modules:
+  # Puts text a device shares on the clipboard while Linksy's window isn't focused.
+  - name: wl-clipboard
+    buildsystem: meson
+    config-opts:
+      - -Dzshcompletiondir=no
+      - -Dfishcompletiondir=no
+    sources:
+      - type: archive
+        url: https://github.com/bugaevc/wl-clipboard/archive/refs/tags/v2.2.1.tar.gz
+        sha256: 6eb8081207fb5581d1d82c4bcd9587205a31a3d47bea3ebeb7f41aa1143783eb
+
+  # X11 screens without a portal: ximagesrc, which the runtime's GStreamer leaves out
+  # (found in /app/lib/gstreamer-1.0 with no setting)
+  - name: gst-plugins-good-ximagesrc
+    buildsystem: meson
+    config-opts:
+      - -Dauto_features=disabled
+      - -Dximagesrc=enabled
+      - -Dximagesrc-xshm=enabled
+      - -Dximagesrc-xfixes=enabled
+      - -Dximagesrc-xdamage=enabled
+      - -Dximagesrc-navigation=enabled
+    sources:
+      - type: archive
+        url: https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-1.28.6.tar.xz
+        sha256: b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df
+
+  - name: linksy
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/linksy/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo build --release --offline -p linksyd -p linksy -p linksy-app -p linksy-screen
+      - install -Dm755 -t /app/bin target/release/linksyd target/release/linksy target/release/linksy-app target/release/linksy-screen
+      # Finish Setup's root helpers, run on the computer with its own pkexec
+      - install -Dm755 -t /app/libexec/linksy data/linksy-system-setup data/linksy-camera-setup data/linksy-usb-setup
+      - install -Dm644 data/mg.diary.linksy.Linksy.desktop /app/share/applications/mg.diary.linksy.Linksy.desktop
+      - install -Dm644 data/mg.diary.linksy.Linksy.metainfo.xml /app/share/metainfo/mg.diary.linksy.Linksy.metainfo.xml
+      - install -Dm644 data/icons/mg.diary.linksy.Linksy.svg /app/share/icons/hicolor/scalable/apps/mg.diary.linksy.Linksy.svg
+      - install -Dm644 data/icons/mg.diary.linksy.Linksy-symbolic.svg /app/share/icons/hicolor/symbolic/apps/mg.diary.linksy.Linksy-symbolic.svg
+      - install -Dm644 data/icons/mg.diary.linksy.Linksy-tray-symbolic.svg /app/share/icons/hicolor/symbolic/apps/mg.diary.linksy.Linksy-tray-symbolic.svg
+      - install -Dm644 data/icons/mg.diary.linksy.Linksy-tray-idle-symbolic.svg /app/share/icons/hicolor/symbolic/apps/mg.diary.linksy.Linksy-tray-idle-symbolic.svg
+      - install -Dm644 -t /app/share/licenses/mg.diary.linksy.Linksy LICENSE THIRD-PARTY-NOTICES
+    sources:
+      # @SOURCE@ (scripts/package-flatpak.sh builds from this checkout instead)
+      - type: git
+        url: https://github.com/LinkSy-mg/linksy-desktop.git
+        tag: v0.12.4
+      - cargo-sources.json
