@@ -379,6 +379,11 @@ pub(crate) async fn handle(node: &Node, history: &History, sessions: &Sessions, 
             node.set_away_all(&id, on).map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
+        Request::SetBrowseMode { phone, all_files } => {
+            let id = resolve(node, &phone)?;
+            node.set_browse_mode(&id, all_files).await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        }
         Request::SetAutoAccept { device, on } => {
             let id = resolve(node, &device)?;
             node.set_auto_accept(&id, on).map_err(|e| e.to_string())?;

@@ -1183,6 +1183,11 @@ impl Node {
         self.send_message(to, &Message::RequestCommands).await
     }
 
+    /// Toggle free storage browsing on a phone (`all_files=true`) or back to picker mode.
+    pub async fn set_browse_mode(&self, to: &Fingerprint, all_files: bool) -> Result<()> {
+        self.send_message(to, &Message::SetBrowseMode { all_files }).await
+    }
+
     /// Ask a device for its volume while connected (`on`), or stop.
     pub async fn watch_volume(&self, to: &Fingerprint, on: bool) -> Result<()> {
         self.send_message(to, &Message::VolumeWatch { on }).await
@@ -2187,6 +2192,10 @@ impl Node {
                                 Ok(Message::Commands { list }) => node.emit(Event::CommandsReceived { from, list }),
                                 Ok(Message::RunCommand { key }) => node.emit(Event::RunCommandRequested { from, key }),
                                 Ok(Message::RequestCommands) => node.emit(Event::RequestCommandsReceived { from }),
+                                Ok(Message::SetBrowseMode { all_files }) => {
+                                    // No desktop-side event needed; the phone switches its FileServer root.
+                                    debug!("{}: browse mode set to all_files={all_files}", from.name);
+                                }
                                 Ok(Message::InboxHistory { app, conversation, before_ms, limit }) if app.len() <= MAX_KEY && conversation.len() <= MAX_KEY => {
                                     node.emit(Event::InboxHistory { from, app, conversation, before_ms, limit: limit.min(MAX_PAGE) })
                                 }

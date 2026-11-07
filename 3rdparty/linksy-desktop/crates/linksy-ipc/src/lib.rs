@@ -98,6 +98,8 @@ pub enum Request {
     FsCancel { op: Uuid },
     /// Whether phones' photos are imported here, and where.
     PhotoPrefs,
+    /// Toggle free storage browsing on a phone's file server.
+    SetBrowseMode { phone: String, all_files: bool },
     SetPhotoPrefs { prefs: PhotoPrefs },
     /// Which devices lock this computer when they leave, and after how long.
     LockPrefs,
@@ -883,6 +885,10 @@ impl Client {
 
     pub async fn fs_cancel(&self, op: Uuid) -> Result<bool, ClientError> {
         self.call(Request::FsCancel { op }).await
+    }
+
+    pub async fn set_browse_mode(&self, phone: impl Into<String>, all_files: bool) -> Result<(), ClientError> {
+        self.call(Request::SetBrowseMode { phone: phone.into(), all_files }).await
     }
 
     pub async fn alerts(&self) -> Result<Vec<Alert>, ClientError> {

@@ -445,6 +445,8 @@ pub enum Message {
     RunCommand { key: String },
     /// Request updated commands list from peer
     RequestCommands,
+    /// Toggle free browsing vs picker-only mode on the phone.
+    SetBrowseMode { all_files: bool },
     /// A conversation's messages older than `before_ms`, from what the phone kept (§4.5).
     InboxHistory { app: String, conversation: String, before_ms: u64, limit: u32 },
     InboxHistoryPage { app: String, conversation: String, messages: Vec<ConversationMessage>, more: bool },

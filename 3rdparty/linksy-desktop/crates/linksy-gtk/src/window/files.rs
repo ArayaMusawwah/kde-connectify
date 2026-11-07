@@ -79,6 +79,7 @@ pub struct FilesView {
     orders: Choices<bool>,
     new_folder: gtk::Button,
     open_folder: gtk::Button,
+    all_files_toggle: gtk::ToggleButton,
     picked_bar: gtk::Box,
     picked: gtk::Label,
     copy: gtk::Button,
@@ -116,12 +117,20 @@ impl FilesView {
         uploads.append(Some(t!("Upload Folders…")), Some("files.upload-folders"));
         let upload = gtk::MenuButton::builder().icon_name("document-send-symbolic").tooltip_text(t!("Upload")).menu_model(&uploads).valign(gtk::Align::Center).css_classes(["flat"]).build();
         let open_folder = gtk::Button::builder().label(t!("Open in Files")).tooltip_text(t!("Open in Files")).valign(gtk::Align::Center).margin_start(4).build();
+        let all_files_toggle = gtk::ToggleButton::builder()
+            .icon_name("folder-symbolic")
+            .tooltip_text(t!("Browse all files on this phone"))
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .visible(false)
+            .build();
         let top = gtk::Box::builder().spacing(2).build();
         top.append(&gtk::ScrolledWindow::builder().child(&crumbs).vscrollbar_policy(gtk::PolicyType::Never).propagate_natural_height(true).hexpand(true).css_classes(["inner-scroll"]).build());
         top.append(&search_toggle);
         top.append(&sort_menu);
         top.append(&new_folder);
         top.append(&upload);
+        top.append(&all_files_toggle);
         top.append(&open_folder);
 
         let search = gtk::SearchEntry::builder().placeholder_text(t!("Search This Folder")).hexpand(true).build();
@@ -243,6 +252,7 @@ impl FilesView {
             orders,
             new_folder,
             open_folder,
+            all_files_toggle,
             picked_bar,
             picked,
             copy,
@@ -397,6 +407,21 @@ impl Window {
                 Some(phone) if path == "/" => w.browse_files(phone),
                 _ => w.files_launch(path),
             }
+        });
+
+        // All-files toggle: switch the phone's FileServer between picker and full storage mode.
+        let w2 = Rc::downgrade(self);
+        f.all_files_toggle.connect_toggled(move |toggle| {
+            let Some(w) = w2.upgrade() else { return };
+            let Some(phone_str) = w.files.state.borrow().phone.map(|p| p.to_string()) else { return };
+            let all_files = toggle.is_active();
+            let w = w.clone();
+            glib::spawn_future_local(async move {
+                let Some(c) = w.client() else { return };
+                if c.set_browse_mode(phone_str, all_files).await.is_ok() {
+                    w.files_open("/".to_string());
+                }
+            });
         });
 
         let v = Rc::downgrade(f);
