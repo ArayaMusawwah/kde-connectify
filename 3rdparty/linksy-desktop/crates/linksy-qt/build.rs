@@ -16,6 +16,8 @@ fn main() {
         "qml/SetupPage.qml",
         "qml/CameraPage.qml",
         "qml/UsbPage.qml",
+        "qml/ControlsCard.qml",
+        "qml/DoctorPage.qml",
         "qml/DeckView.qml",
         "qml/WhatsNew.qml",
         "qml/UpgradeDialog.qml",
@@ -26,6 +28,7 @@ fn main() {
         "qml/KeyedList.qml",
         "qml/Inbox.qml",
         "qml/InboxTab.qml",
+        "qml/OnboardingPage.qml",
     ]))
         .qt_module("Quick")
         .qt_module("QuickControls2")

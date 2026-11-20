@@ -9,6 +9,9 @@ mod codes;
 mod controls;
 #[cfg(target_os = "linux")]
 mod deck;
+#[cfg(target_os = "linux")]
+mod deck_cmd;
+mod doctor;
 mod gallery;
 mod history;
 mod inbox;
@@ -19,6 +22,10 @@ mod mirror;
 #[cfg(target_os = "linux")]
 mod network;
 mod files_server;
+#[cfg(target_os = "linux")]
+mod outbox;
+#[cfg(target_os = "linux")]
+mod phone_controls;
 mod phone_files;
 mod photos;
 mod pictures;
@@ -64,7 +71,7 @@ pub static QUIT: tokio::sync::Notify = tokio::sync::Notify::const_new();
 const FEATURES: &[&str] = &[
     "files", "clipboard", "open_url", "ring", "battery", "media_state", "media_remote", "call_state", "heartbeat",
     "import", "fs", "input", "screen", "control", "display", "camera", "watch", "notifications", "sms",
-    "clipboard_file", "microphone", "picture", "deck", "preflight",
+    "clipboard_file", "microphone", "picture", "deck", "deck_layout_save", "preflight",
 ];
 
 /// Fixed default port so a peer's last known address stays valid across restarts.
@@ -265,6 +272,16 @@ async fn run() -> ExitCode {
     tokio::spawn(media::run(node.clone(), icons.join("art")));
     #[cfg(target_os = "linux")]
     tokio::spawn(volume::run(node.clone()));
+    #[cfg(target_os = "linux")]
+    {
+        let _ = outbox::OUTBOX.set(outbox::Outbox::load(data_dir.join("outbox.json")));
+        tokio::spawn(outbox::run(node.clone()));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = phone_controls::CONTROLS.set(phone_controls::Controls::load(data_dir.join("dnd_sync.json")));
+        tokio::spawn(phone_controls::run(node.clone()));
+    }
     #[cfg(target_os = "linux")]
     {
         let deck = deck::Deck::load(data_dir.join("deck.json"), deck::System::default());

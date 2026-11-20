@@ -33,6 +33,17 @@ pub async fn serve(node: Node, history: History, sessions: Sessions, mirror: Mir
     }
 }
 
+/// Told when the user chose Quit in the tray, so open apps close with the service.
+static QUITTING: std::sync::LazyLock<tokio::sync::broadcast::Sender<()>> = std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(4).0);
+
+/// Tell every app the service is about to stop for good (the tray's Quit), and give the news
+/// a moment to arrive. Quitting for an update or a restart doesn't say it: those windows stay.
+pub async fn announce_quit() {
+    if QUITTING.send(()).is_ok() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
 async fn client(node: Node, history: History, sessions: Sessions, mirror: Mirror, away: Away, photos: Photos, commands: Commands, stream: UnixStream) {
     let (read, mut write) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
@@ -50,6 +61,13 @@ async fn client(node: Node, history: History, sessions: Sessions, mirror: Mirror
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => warn!("client lagged, dropped {n} events"),
                 Err(_) => break,
             }
+        }
+    });
+    let mut quitting = QUITTING.subscribe();
+    let quit_tx = tx.clone();
+    let forward_quit = tokio::spawn(async move {
+        if quitting.recv().await.is_ok() {
+            let _ = quit_tx.send(ServerMsg::Quitting { quitting: true });
         }
     });
     let mut updates = history.subscribe();
@@ -134,6 +152,7 @@ async fn client(node: Node, history: History, sessions: Sessions, mirror: Mirror
         });
     }
     forward.abort();
+    forward_quit.abort();
     forward_history.abort();
     forward_inbox.abort();
     if let Some(f) = forward_files {
@@ -219,6 +238,40 @@ pub(crate) async fn handle(node: &Node, history: &History, sessions: &Sessions, 
         Request::Ring { to, on } => {
             let id = resolve(node, &to)?;
             node.ring(&id, on).await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::Doctor => json(serde_json::to_value(crate::doctor::run(node, usb_status().phones).await)),
+        Request::PhoneControls { phone } => {
+            let id = paired(node, &phone)?;
+            let controls = crate::phone_controls::CONTROLS.get().ok_or("phone controls aren't running")?;
+            json(serde_json::to_value(controls.info(&id).await))
+        }
+        Request::SetPhoneControls { phone, change } => {
+            let id = paired(node, &phone)?;
+            node.set_controls(&id, change).await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        }
+        Request::SetDndSync { phone, on } => {
+            let id = paired(node, &phone)?;
+            crate::phone_controls::CONTROLS.get().ok_or("phone controls aren't running")?.set_sync(id, on)?;
+            Ok(Value::Null)
+        }
+        Request::ComputerNotifications { phone } => {
+            let id = paired(node, &phone)?;
+            json(serde_json::to_value(crate::outbox::OUTBOX.get().ok_or("notifications for phones aren't running")?.info(&id)))
+        }
+        Request::SetComputerNotifications { phone, on } => {
+            let id = paired(node, &phone)?;
+            crate::outbox::OUTBOX.get().ok_or("notifications for phones aren't running")?.set(id, on)?;
+            Ok(Value::Null)
+        }
+        Request::MuteComputerApp { app, muted } => {
+            crate::outbox::OUTBOX.get().ok_or("notifications for phones aren't running")?.mute(&app, muted)?;
+            Ok(Value::Null)
+        }
+        Request::Snap { to } => {
+            let id = resolve(node, &to)?;
+            node.request_snap(&id).await.map_err(|e| e.to_string())?;
             Ok(Value::Null)
         }
         Request::TurnOn { to, feature } => {
@@ -400,8 +453,12 @@ pub(crate) async fn handle(node: &Node, history: &History, sessions: &Sessions, 
             Ok(Value::Null)
         }
         Request::SetDeckCommands { commands } => json(serde_json::to_value(deck().await?.set_commands(commands)?)),
-        Request::DeckLayouts { phone } => json(serde_json::to_value(deck().await?.layouts(&paired(node, &phone)?))),
-        Request::SetDeckLayouts { phone, layouts } => json(serde_json::to_value(deck().await?.set_layouts(&paired(node, &phone)?, layouts)?)),
+        Request::TestDeckCommand { line } => {
+            if line.trim().is_empty() || line.len() > crate::deck_cmd::MAX_LINE {
+                return Err("a command line is 1 to 4000 characters".into());
+            }
+            json(serde_json::to_value(crate::deck_cmd::test(&line).await))
+        }
         Request::ForgetScreen => Ok(Value::Bool(sessions.forget_screen())),
         Request::Locate { device } => {
             let id = resolve(node, &device)?;
@@ -508,14 +565,17 @@ pub(crate) async fn handle(node: &Node, history: &History, sessions: &Sessions, 
                 let session = node.request_session(&id, linksy_core::SessionKind::Screen).await.map_err(|e| e.to_string())?;
                 let session_id = session.id;
                 let socket = sessions.view_driven(session, dev, node.clone()).map_err(|e| e.to_string())?;
+                sessions.play_sound_with(node, id, session_id);
                 return json(serde_json::to_value(SessionInfo { session: session_id, socket: Some(socket) }));
             }
+            let phone_id = id;
             let session = node.request_session(&id, kind).await.map_err(|e| e.to_string())?;
             let id = session.id;
             // A second display: this device shares, the service runs that side. A camera or
             // microphone: the service turns it into a device here. Otherwise the app shows it.
             let socket = if session.sharing {
-                sessions.spawn_share(session);
+                let link = node.link(&phone_id);
+                sessions.spawn_share(session, link);
                 None
             } else if kind.is_device() {
                 sessions.spawn_device(session);
@@ -523,6 +583,10 @@ pub(crate) async fn handle(node: &Node, history: &History, sessions: &Sessions, 
             } else {
                 Some(sessions.view(session).map_err(|e| e.to_string())?)
             };
+            // A phone's screen, here: its sound too
+            if matches!(kind, linksy_core::SessionKind::Screen | linksy_core::SessionKind::Control) {
+                sessions.play_sound_with(node, phone_id, id);
+            }
             json(serde_json::to_value(SessionInfo { session: id, socket }))
         }
         Request::PendingSessions => json(serde_json::to_value(sessions.pending())),

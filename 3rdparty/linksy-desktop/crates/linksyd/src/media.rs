@@ -30,6 +30,8 @@ const PLAYER: &str = "org.mpris.MediaPlayer2.Player";
 const OURS: &str = "org.mpris.MediaPlayer2.connectify_";
 /// Largest cover art passed along (the protocol allows 64 KiB).
 const MAX_ART: usize = 48 * 1024;
+/// A file bigger than this is not read as a cover at all.
+const MAX_ART_FILE: usize = 16 * 1024 * 1024;
 /// A bigger picture is scaled down to fit this many pixels a side, as JPEG.
 const ART_SIDES: [u32; 3] = [400, 300, 200];
 
@@ -210,23 +212,24 @@ impl Local {
     }
 
     async fn snapshot(&mut self) -> MediaState {
-        let mut players = Vec::new();
+        let mut seen = Vec::new();
         let names = self.names().await;
         for name in &names {
             match self.player(name).await {
-                Ok(p) => players.push(p),
+                Ok(p) => seen.push(p),
                 Err(e) => debug!("{name}: {e}"),
             }
         }
         self.clocks.lock().unwrap().retain(|name, _| names.contains(name));
         let seq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-        MediaState { seq, players }
+        MediaState { seq, players: drop_shadowed(seen) }
     }
 
-    async fn player(&self, name: &str) -> zbus::Result<MediaPlayer> {
+    async fn player(&self, name: &str) -> zbus::Result<Seen> {
         let root = self.proxy(name, "org.mpris.MediaPlayer2").await?;
         let player = self.proxy(name, PLAYER).await?;
         let app: String = root.get_property("Identity").await.unwrap_or_else(|_| name[MPRIS.len()..].to_string());
+        let entry = entry_name(&root.get_property::<String>("DesktopEntry").await.unwrap_or_default());
         let status: String = player.get_property("PlaybackStatus").await?;
         let meta: HashMap<String, OwnedValue> = player.get_property("Metadata").await.unwrap_or_default();
         let text = |key: &str| meta.get(key).and_then(|v| String::try_from(v.clone()).ok()).unwrap_or_default();
@@ -237,7 +240,7 @@ impl Local {
         let length_ms = length.filter(|l| *l > 0).map(|l| l as u64 / 1000);
         let position_ms = self.position(name, Track { title: text("xesam:title"), length_ms }, playing, position.filter(|p| *p >= 0).map(|p| p as u64 / 1000)).await;
         let flag = |v: zbus::Result<bool>| v.unwrap_or(false);
-        Ok(MediaPlayer {
+        let player = MediaPlayer {
             id: name[MPRIS.len()..].to_string(),
             app,
             title: text("xesam:title"),
@@ -250,7 +253,8 @@ impl Local {
             can_previous: flag(player.get_property("CanGoPrevious").await),
             can_seek: flag(player.get_property("CanSeek").await),
             art: self.art(&text("mpris:artUrl")),
-        })
+        };
+        Ok(Seen { player, entry })
     }
 
     /// Pause every player that's playing; their names, to resume.
@@ -330,14 +334,20 @@ impl Local {
     /// Cover art from a local file, small enough to pass along.
     fn art(&self, url: &str) -> Option<String> {
         let path = percent_decode(url.strip_prefix("file://")?);
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+        // The Flatpak can't see the player's folder, so the computer reads it, one process a
+        // time: no asking after the file's time on every call, it is read again every 10 s.
+        let modified = if linksy_host::flatpak() {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() / 10 * 10)
+        } else {
+            std::fs::metadata(&path).and_then(|m| m.modified()).ok()?
+        };
         let mut known = self.art.lock().unwrap();
         if let Some((when, art)) = known.get(&path)
             && *when == modified
         {
             return art.clone();
         }
-        let art = std::fs::read(&path).ok().and_then(small_art).map(|a| base64::engine::general_purpose::STANDARD.encode(a));
+        let art = linksy_host::read_bytes(std::path::Path::new(&path), MAX_ART_FILE).and_then(small_art).map(|a| base64::engine::general_purpose::STANDARD.encode(a));
         // Players come and go: only the pictures of late
         if known.len() > 16 {
             known.clear();
@@ -654,9 +664,124 @@ fn owned(v: Value<'_>) -> OwnedValue {
     v.try_to_owned().expect("plain values convert")
 }
 
+/// A player and the desktop entry it names: lowercase, without ".desktop", empty when none.
+struct Seen {
+    player: MediaPlayer,
+    entry: String,
+}
+
+fn entry_name(raw: &str) -> String {
+    let raw = raw.trim().to_lowercase();
+    raw.strip_suffix(".desktop").unwrap_or(&raw).to_string()
+}
+
+/// "Firefox" and "Mozilla Firefox" are one app.
+fn same_app(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    a.len() >= 4 && b.len() >= 4 && (a.contains(&b) || b.contains(&a))
+}
+
+/// Plasma's browser integration reports a tab's media beside the browser's own MPRIS player,
+/// so one track shows up twice (desktop#87). Where the integration has a track, the browser's
+/// own player is dropped: the same desktop entry or app name, or the same track. A different
+/// player on the same track goes too; its better metadata stays.
+fn drop_shadowed(seen: Vec<Seen>) -> Vec<MediaPlayer> {
+    const PLASMA: &str = "plasma-browser-integration";
+    let plasma: Vec<&Seen> = seen.iter().filter(|s| s.player.id.starts_with(PLASMA) && !s.player.title.is_empty()).collect();
+    let shadowed = |s: &Seen| {
+        !s.player.id.starts_with(PLASMA)
+            && plasma.iter().any(|p| {
+                let (pp, q) = (&p.player, &s.player);
+                let same_track = pp.title == q.title && (pp.artist.is_empty() || q.artist.is_empty() || pp.artist == q.artist);
+                let same_browser = (!s.entry.is_empty() && p.entry == s.entry) || same_app(&pp.app, &q.app);
+                same_track || same_browser
+            })
+    };
+    let shadowed: Vec<bool> = seen.iter().map(shadowed).collect();
+    seen.into_iter().zip(shadowed).filter(|(_, gone)| !gone).map(|(s, _)| s.player).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seen(id: &str, app: &str, entry: &str, title: &str, artist: &str) -> Seen {
+        let player = MediaPlayer {
+            id: id.into(),
+            app: app.into(),
+            title: title.into(),
+            artist: artist.into(),
+            album: String::new(),
+            playing: true,
+            position_ms: None,
+            length_ms: None,
+            can_next: false,
+            can_previous: false,
+            can_seek: false,
+            art: None,
+        };
+        Seen { player, entry: entry_name(entry) }
+    }
+
+    fn firefox(title: &str, artist: &str) -> Seen {
+        seen("firefox.instance_1_67", "Mozilla Firefox", "firefox", title, artist)
+    }
+
+    fn plasma(title: &str, artist: &str) -> Seen {
+        seen("plasma-browser-integration", "Firefox", "firefox.desktop", title, artist)
+    }
+
+    fn ids(players: &[MediaPlayer]) -> Vec<&str> {
+        players.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    #[test]
+    fn the_browsers_own_copy_of_a_track_gives_way_to_plasmas() {
+        assert_eq!(ids(&drop_shadowed(vec![firefox("Song", "Band"), plasma("Song", "Band")])), ["plasma-browser-integration"]);
+        // Plasma often has no artist where the browser does, or the other way round
+        assert_eq!(ids(&drop_shadowed(vec![firefox("Song", ""), plasma("Song", "Band")])), ["plasma-browser-integration"]);
+    }
+
+    #[test]
+    fn the_browsers_own_player_goes_when_the_titles_differ() {
+        // The page's title on one side, the media's on the other: same desktop entry
+        assert_eq!(ids(&drop_shadowed(vec![firefox("Song - YouTube", ""), plasma("Song", "Band")])), ["plasma-browser-integration"]);
+        // No desktop entry on either: the app's name says it
+        let mut native = firefox("Song - YouTube", "");
+        native.entry.clear();
+        let mut integration = plasma("Song", "Band");
+        integration.entry.clear();
+        assert_eq!(ids(&drop_shadowed(vec![native, integration])), ["plasma-browser-integration"]);
+    }
+
+    #[test]
+    fn other_players_stay() {
+        let kept = drop_shadowed(vec![
+            seen("spotify", "Spotify", "spotify", "Other", "Band"),
+            plasma("Song", "Band"),
+            seen("vlc", "VLC media player", "vlc", "Song", "Someone Else"),
+            seen("chromium.instance7", "Chromium", "chromium", "Another", ""),
+        ]);
+        assert_eq!(ids(&kept), ["spotify", "plasma-browser-integration", "vlc", "chromium.instance7"]);
+    }
+
+    #[test]
+    fn nothing_changes_without_plasma_or_a_track() {
+        let two = drop_shadowed(vec![seen("mpv.instance1", "mpv", "mpv", "Song", "Band"), seen("mpv.instance2", "mpv", "mpv", "Song", "Band")]);
+        assert_eq!(ids(&two), ["mpv.instance1", "mpv.instance2"]);
+        let idle = drop_shadowed(vec![firefox("Song", "Band"), plasma("", "")]);
+        assert_eq!(ids(&idle), ["firefox.instance_1_67", "plasma-browser-integration"]);
+    }
+
+    #[test]
+    fn desktop_entries_compare_without_their_suffix() {
+        assert_eq!(entry_name(" Firefox.desktop\n"), "firefox");
+        assert_eq!(entry_name("org.mozilla.firefox"), "org.mozilla.firefox");
+        assert_eq!(entry_name(""), "");
+        assert!(same_app("Firefox", "Mozilla Firefox"));
+        assert!(!same_app("Firefox", "VLC media player"));
+        assert!(!same_app("mpv", "mpv"), "a short name is no evidence");
+    }
 
 
     #[test]

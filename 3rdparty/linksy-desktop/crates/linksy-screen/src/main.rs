@@ -25,6 +25,9 @@
 //! session: decodes the stream read from the socket and offers it to every app as a
 //! PipeWire camera called NAME (browsers, Meet, GNOME Snapshot, OBS…).
 //!
+//! `linksy-screen speaker --socket PATH [--test]` plays the sound a phone shares with its screen
+//! (raw 16-bit 48 kHz stereo PCM) on this computer's speakers; `--test` plays nothing.
+//!
 //! `linksy-screen share --mic --socket PATH [--test]` shares this device's microphone, and
 //! `linksy-screen mic --socket PATH [--name NAME]` offers a received one to every app as
 //! a microphone called NAME. Audio crosses as raw 16-bit 48 kHz mono PCM (docs/protocol.md
@@ -33,6 +36,7 @@
 mod mutter;
 mod outputs;
 mod portal;
+mod virtual_mic;
 mod wlr;
 mod x11;
 
@@ -40,6 +44,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -52,6 +57,12 @@ struct Args {
     fps: u32,
     /// `mic` mode: publish the incoming audio as a microphone with this name.
     microphone: Option<String>,
+    /// The video bitrate in kbit/s (16000 on a local network or cable, less over the internet).
+    bitrate: u32,
+    /// The most frames a second (60; 30 over the internet).
+    max_fps: u32,
+    /// `speaker` mode: play the incoming sound.
+    speaker: bool,
     camera: bool,
     /// Share this device's microphone.
     mic: bool,
@@ -68,19 +79,26 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
+    let mut speaker = false;
     let (mut webcam, mut microphone) = match args.next().as_deref() {
         Some("share") => (None, None),
+        Some("speaker") => {
+            speaker = true;
+            (None, None)
+        }
         Some("webcam") => (Some("Linksy Camera".to_string()), None),
         Some("mic") => (None, Some("Linksy Microphone".to_string())),
         _ => {
-            return Err("usage: linksy-screen share --socket PATH [--token-file PATH] [--camera | --mic | --control | --input-only] [--virtual [--size WxH]] [--output NAME] [--test]\n       \
+            return Err("usage: linksy-screen share --socket PATH [--token-file PATH] [--camera | --mic | --control | --input-only] [--virtual [--size WxH]] [--output NAME] [--bitrate KBPS] [--max-fps 30|60] [--test]\n       \
                         linksy-screen webcam --socket PATH [--name NAME] [--fps 30|60]\n       \
-                        linksy-screen mic --socket PATH [--name NAME]"
+                        linksy-screen mic --socket PATH [--name NAME]\n       \
+                        linksy-screen speaker --socket PATH [--test]"
                 .into());
         }
     };
     let (mut socket, mut token_file, mut control, mut test, mut camera, mut mic) = (None, None, false, false, false, false);
     let (mut input_only, mut output) = (false, None);
+    let (mut bitrate, mut max_fps) = (16_000u32, MAX_FPS);
     let mut fps = 30;
     let (mut is_virtual, mut size) = (false, (1920, 1080));
     while let Some(a) = args.next() {
@@ -96,6 +114,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--output" => output = args.next(),
             "--test" => test = true,
+            "--bitrate" => bitrate = args.next().and_then(|v| v.parse().ok()).filter(|k| (500..=60_000).contains(k)).ok_or("--bitrate takes kbit/s, 500 to 60000")?,
+            "--max-fps" => max_fps = args.next().and_then(|v| v.parse().ok()).filter(|f| matches!(f, 30 | 60)).ok_or("--max-fps takes 30 or 60")?,
             "--camera" => camera = true,
             "--mic" => mic = true,
             "--fps" => fps = args.next().and_then(|v| v.parse().ok()).filter(|f| matches!(f, 30 | 60)).ok_or("--fps takes 30 or 60")?,
@@ -104,7 +124,7 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown option {other}")),
         }
     }
-    Ok(Args { webcam, fps, microphone, camera, mic, socket: socket.ok_or("--socket is required")?, token_file, control, input_only, virtual_size: is_virtual.then_some(size), output, test })
+    Ok(Args { webcam, fps, microphone, bitrate, max_fps, speaker, camera, mic, socket: socket.ok_or("--socket is required")?, token_file, control, input_only, virtual_size: is_virtual.then_some(size), output, test })
 }
 
 fn main() -> ExitCode {
@@ -115,6 +135,9 @@ fn main() -> ExitCode {
     // SAFETY: a plain prctl on this process
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+    }
+    if std::env::args().nth(1).as_deref() == Some("check") {
+        return check();
     }
     let args = match parse_args() {
         Ok(a) => a,
@@ -127,9 +150,83 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("linksy-screen: {e}");
-            ExitCode::FAILURE
+            if MISSING.load(Ordering::Relaxed) { ExitCode::from(MISSING_PIECE) } else { ExitCode::FAILURE }
         }
     }
+}
+
+/// The exit code for "GStreamer lacks something here": the service tells the person, who
+/// would otherwise only see the session close (desktop#85).
+const MISSING_PIECE: u8 = 3;
+static MISSING: AtomicBool = AtomicBool::new(false);
+
+/// An error that is a missing piece of GStreamer.
+fn missing(what: impl Into<String>) -> String {
+    MISSING.store(true, Ordering::Relaxed);
+    what.into()
+}
+
+/// `linksy-screen check`: what each feature lacks here, then the real thing on a test
+/// picture and a test tone, so "it doesn't work" comes with why. Exits 3 if a piece is missing.
+fn check() -> ExitCode {
+    use linksy_setup::pieces::Feature;
+    if let Err(e) = gst::init() {
+        println!("GStreamer doesn't start: {e}");
+        return ExitCode::from(MISSING_PIECE);
+    }
+    let has = |element: &str| gst::ElementFactory::find(element).is_some();
+    let mut ready = true;
+    for feature in Feature::ALL {
+        let lacking = feature.lacking(has);
+        if lacking.is_empty() {
+            println!("{}: ready", feature.name());
+        }
+        for piece in lacking {
+            ready = false;
+            println!("{}: GStreamer has no {} here", feature.name(), piece.elements.join(" or "));
+        }
+    }
+    match (camera_device(), has("v4l2sink"), has("pipewiresink")) {
+        (Some(_), true, _) => println!("phone camera: shown to every app (the Linksy Camera device)"),
+        (Some(_), false, true) => println!("phone camera: PipeWire apps only, GStreamer has no v4l2sink here (browsers and Zoom need it)"),
+        (None, _, true) => println!("phone camera: PipeWire apps only, there is no Linksy Camera device (Finish Setup makes it)"),
+        (_, _, false) => {}
+    }
+    // The picture a phone sends, made and read back here
+    let decoder = ["avdec_h264", "vah264dec", "openh264dec"].into_iter().find(|d| gst::ElementFactory::make(d).build().is_ok());
+    let video = decoder.and_then(|decoder| {
+        encoders(4000).into_iter().find_map(|(encoder, format)| {
+            let name = encoder.split_whitespace().next().unwrap_or_default().to_string();
+            let trial = format!(
+                "videotestsrc num-buffers=30 ! video/x-raw,width=640,height=480,framerate=30/1 ! videoconvert ! video/x-raw,format={format} \
+                 ! {encoder} ! video/x-h264,profile=constrained-baseline ! h264parse ! {} ! videoconvert ! fakesink",
+                low_latency(decoder)
+            );
+            match play(&trial) {
+                Ok(()) => Some(format!("{name} and {decoder}")),
+                Err(e) => {
+                    println!("video: {name} doesn't work here ({e})");
+                    None
+                }
+            }
+        })
+    });
+    match video {
+        Some(with) => println!("video: a test picture was encoded and decoded ({with})"),
+        None => {
+            ready = false;
+            println!("video: no H.264 encoder and decoder work together here");
+        }
+    }
+    let tone = format!("audiotestsrc num-buffers=50 ! audioconvert ! audioresample ! {MIC_CAPS} ! {} ! audioconvert ! fakesink", mic_gain());
+    match play(&tone) {
+        Ok(()) => println!("audio: a test tone went through"),
+        Err(e) => {
+            ready = false;
+            println!("audio: {e}");
+        }
+    }
+    if ready { ExitCode::SUCCESS } else { ExitCode::from(MISSING_PIECE) }
 }
 
 fn run(args: Args) -> Result<(), String> {
@@ -139,6 +236,9 @@ fn run(args: Args) -> Result<(), String> {
     }
     if let Some(name) = &args.microphone {
         return microphone(&args.socket, name);
+    }
+    if args.speaker {
+        return speaker(&args.socket, args.test);
     }
     if args.mic {
         return share_mic(&args.socket, args.test);
@@ -160,7 +260,9 @@ fn run(args: Args) -> Result<(), String> {
             .ok()
             .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))))
             .unwrap_or((1280, 720));
-        let pattern = format!("videotestsrc is-live=true pattern=ball motion=sweep background-color=0xff2563ff ! video/x-raw,width={w},height={h},framerate=30/1");
+        // LINKSY_SCREEN_TEST_FPS=60 imitates a screen that moves 60 times a second.
+        let fps: u32 = std::env::var("LINKSY_SCREEN_TEST_FPS").ok().and_then(|f| f.parse().ok()).unwrap_or(30);
+        let pattern = format!("videotestsrc is-live=true pattern=ball motion=sweep background-color=0xff2563ff ! video/x-raw,width={w},height={h},framerate={fps}/1");
         (pattern, args.control.then_some(portal::Input::Log))
     } else {
         open_capture(&args, &rt)?
@@ -196,11 +298,11 @@ fn run(args: Args) -> Result<(), String> {
     // can take longer to encode than a frame lasts: at most 30 a second there, converted on
     // several threads. A GPU encoder that's listed but doesn't work (a sandbox's drivers, an
     // unusual card) falls through to the next.
-    let mut attempts: Vec<(&str, &str, Memory)> = Vec::new();
-    for (encoder, format) in encoders() {
+    let mut attempts: Vec<(String, &str, Memory)> = Vec::new();
+    for (encoder, format) in encoders(args.bitrate) {
         let gpu = encoder.starts_with("va") && vapostproc;
         if gpu && screen {
-            attempts.push((encoder, format, Memory::Gpu));
+            attempts.push((encoder.clone(), format, Memory::Gpu));
         }
         attempts.push((encoder, format, Memory::System));
     }
@@ -208,7 +310,9 @@ fn run(args: Args) -> Result<(), String> {
     let tried: Vec<String> = attempts.iter().map(|(e, _, m)| format!("{}{}", e.split_whitespace().next().unwrap_or(""), if *m == Memory::Gpu { " (graphics memory)" } else { "" })).collect();
     eprintln!("linksy-screen: encoders, in order: {}", if tried.is_empty() { "none".to_string() } else { tried.join(", ") });
     let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
-    let chain = |(encoder, format, memory): (&str, &str, Memory), size: &str| -> String {
+    let max_fps = args.max_fps;
+    let chain = |(encoder, format, memory): &(String, &str, Memory), size: &str| -> String {
+        let (format, memory) = (*format, *memory);
         let gpu = encoder.starts_with("va") && vapostproc;
         // Copied: the desktop's few buffers go back to it at once
         let copy = if screen && memory == Memory::System { " always-copy=true" } else { "" };
@@ -219,10 +323,14 @@ fn run(args: Args) -> Result<(), String> {
             // Whatever the source gives (a bare "video/x-raw" isn't caps to the parser)
             Memory::System => "identity".to_string(),
         };
+        // Up to 60 frames a second, however fast the screen is (144 Hz ones too): dropped here
+        // where it costs nothing, and brought down to 30 by `adapt_rate` when the encoder can't
+        // keep up
+        let rate = format!("videorate name=rate drop-only=true max-rate={max_fps}");
         let convert = if gpu {
-            "vapostproc ! capsfilter caps=\"video/x-raw(memory:VAMemory),format=NV12\"".to_string()
+            format!("{rate} ! vapostproc ! capsfilter caps=\"video/x-raw(memory:VAMemory),format=NV12\"")
         } else {
-            format!("videorate drop-only=true max-rate=30 ! videoconvert n-threads={threads} ! video/x-raw,format={format}")
+            format!("{rate} ! videoconvert n-threads={threads} ! video/x-raw,format={format}")
         };
         format!("{copy} ! {caps} ! queue name=captured max-size-buffers=1 leaky=downstream ! {convert} ! queue max-size-buffers=2 leaky=downstream ! {encoder} name=encoder")
     };
@@ -234,14 +342,16 @@ fn run(args: Args) -> Result<(), String> {
     let mut restarts = 0;
     let mut attempt = 0;
     let result = loop {
-        let Some(&current) = attempts.get(attempt) else { break Err("no H.264 encoder here works (install openh264 or x264)".to_string()) };
-        let (encoder, _, memory) = current;
-        let name = encoder.split_whitespace().next().unwrap_or("encoder");
+        let Some(current) = attempts.get(attempt).cloned() else { break Err(missing("no H.264 encoder here works (install openh264 or x264)")) };
+        let (encoder, _, memory) = &current;
+        let memory = *memory;
+        let name = encoder.split_whitespace().next().unwrap_or("encoder").to_string();
+        let name = name.as_str();
         let description = format!(
             "{source}{} ! video/x-h264,profile=constrained-baseline ! h264parse config-interval=-1 \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! fdsink fd={} sync=false",
-            chain(current, &size),
+            chain(&current, &size),
             out.as_raw_fd()
         );
         let pipeline = match gst::parse::launch(&description) {
@@ -253,6 +363,7 @@ fn run(args: Args) -> Result<(), String> {
             }
         };
         let last_frame = count_frames(&pipeline, name);
+        adapt_rate(&pipeline, max_fps);
         let outcome = match pipeline.set_state(gst::State::Playing) {
             // Why, from the element that refused (set_state only says that one did)
             Err(_) => Some(Ended(Err(bus_error(&pipeline).unwrap_or_else(|| "an element failed to start".into())))),
@@ -400,6 +511,58 @@ fn open_capture(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(String, Op
     Ok((source, input))
 }
 
+/// The most frames a second a shared screen is encoded at; 30 is what it falls back to.
+const MAX_FPS: u32 = 60;
+const SLOW_FPS: u32 = 30;
+
+/// Encode at 60 where this computer can, and at 30 where it can't, by itself. Every two seconds
+/// it looks at how many of the frames the screen gave were encoded: when a screen that moves
+/// (more than 45 a second) is encoded at under 86 % of the rate wanted twice running, the rate limit goes
+/// down to 30 for good: an even 30 looks better than a 60 that stutters.
+fn adapt_rate(pipeline: &gst::Element, max_fps: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Already at the slow rate
+    if max_fps <= SLOW_FPS {
+        return;
+    }
+    let Some(bin) = pipeline.downcast_ref::<gst::Bin>() else { return };
+    let Some(rate) = bin.by_name("rate") else { return };
+    let counts = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    // What the screen gives, and what comes out encoded
+    for (name, pad, i) in [("captured", "sink", 0), ("encoder", "src", 1)] {
+        if let Some(pad) = bin.by_name(name).and_then(|e| e.static_pad(pad)) {
+            let counts = counts.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counts[i].fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        }
+    }
+    let (counts, rate) = (std::sync::Arc::downgrade(&counts), rate.downgrade());
+    std::thread::spawn(move || {
+        let mut behind = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let (Some(counts), Some(rate)) = (counts.upgrade(), rate.upgrade()) else { return };
+            let (shown, encoded) = (counts[0].swap(0, Ordering::Relaxed) as f64 / 2.0, counts[1].swap(0, Ordering::Relaxed) as f64 / 2.0);
+            let wanted = shown.min(MAX_FPS as f64);
+            behind = if falls_behind(shown, encoded) { behind + 1 } else { 0 };
+            if behind >= 2 {
+                eprintln!("linksy-screen: encoding {encoded:.0} of {wanted:.0} frames a second; keeping to {SLOW_FPS}");
+                rate.set_property("max-rate", SLOW_FPS as i32);
+                return;
+            }
+        }
+    });
+}
+
+/// Whether an encoder is too slow for 60 frames a second: the screen moves more than 45 times a
+/// second, and under 86 % of the frames wanted (the screen's, up to the limit) come out. A screen
+/// faster than the limit is meant to lose frames; the rest is the encoder's.
+fn falls_behind(shown: f64, encoded: f64) -> bool {
+    shown > 45.0 && encoded < shown.min(MAX_FPS as f64) * 0.86
+}
+
 /// Every 10 seconds, how many frames the screen gave and how many were encoded (the
 /// rest were dropped because the encoder was behind), for Save Logs. Returns when the last
 /// frame came (milliseconds since the epoch; 0 before the first). The report ends with the
@@ -471,14 +634,17 @@ fn input_only(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
 /// The best H.264 encoder available, and the raw format it wants: the GPU first, then
 /// x264, then OpenH264 (always present on Fedora). All are asked for Constrained
 /// Baseline, which every H.264 decoder handles (OpenH264's, phones' hardware ones).
-fn encoders() -> Vec<(&'static str, &'static str)> {
-    let has = |name: &str| gst::ElementFactory::find(name).is_some();
+fn encoders(kbps: u32) -> Vec<(String, &'static str)> {
+    // LINKSY_SCREEN_ENCODERS=x264enc,openh264enc allows only those (to try the CPU ones where
+    // there is a GPU, say).
+    let only: Option<Vec<String>> = std::env::var("LINKSY_SCREEN_ENCODERS").ok().map(|l| l.split(',').map(|e| e.trim().to_string()).collect());
+    let has = |name: &str| gst::ElementFactory::find(name).is_some() && only.as_ref().is_none_or(|o| o.iter().any(|e| e == name));
     let mut list = Vec::new();
     if has("vah264lpenc") && constant_bitrate("vah264lpenc") {
-        list.push(("vah264lpenc rate-control=cbr bitrate=16000 key-int-max=60 target-usage=7", "NV12"));
+        list.push((format!("vah264lpenc rate-control=cbr bitrate={kbps} key-int-max=60 target-usage=7"), "NV12"));
     }
     if has("vah264enc") && constant_bitrate("vah264enc") {
-        list.push(("vah264enc rate-control=cbr bitrate=16000 key-int-max=60 target-usage=7", "NV12"));
+        list.push((format!("vah264enc rate-control=cbr bitrate={kbps} key-int-max=60 target-usage=7"), "NV12"));
     }
     if has("x264enc") {
         // One slice per frame: zerolatency would cut each frame into a slice per thread,
@@ -487,10 +653,11 @@ fn encoders() -> Vec<(&'static str, &'static str)> {
         // ultrafast: a sharp desktop with windows moving on it cost superfast 10 times more
         // live than a video does (half-pixel motion search), and fell to 4 fps on a laptop on
         // battery; 16 Mbit/s keeps it sharp, which a local network carries easily.
-        list.push(("x264enc tune=zerolatency speed-preset=ultrafast bitrate=16000 key-int-max=60 bframes=0 sliced-threads=false threads=2", "I420"));
+        list.push((format!("x264enc tune=zerolatency speed-preset=ultrafast bitrate={kbps} key-int-max=60 bframes=0 sliced-threads=false threads=2"), "I420"));
     }
     if has("openh264enc") {
-        list.push(("openh264enc usage-type=screen complexity=low rate-control=bitrate bitrate=8000000 gop-size=60", "I420"));
+        // OpenH264 counts in bit/s, and is held to half what the others get: it is the CPU's last resort
+        list.push((format!("openh264enc usage-type=screen complexity=low rate-control=bitrate bitrate={} gop-size=60", u64::from(kbps) * 500), "I420"));
     }
     list
 }
@@ -525,6 +692,47 @@ pub fn camera_device() -> Option<PathBuf> {
     })
 }
 
+/// The step that gives the decoded stream a fixed frame rate, which a camera device needs.
+/// `capssetter` (gst-plugins-good's "debug" plugin) does it without touching the frames; some
+/// installs lack it and the session then ended at once (desktop#85), so `videorate`, from
+/// gst-plugins-base, does it there. With no timestamps to go by it passes every frame on.
+fn fixed_rate(fps: u32) -> String {
+    if gst::ElementFactory::find("capssetter").is_some() {
+        format!("capssetter caps=video/x-raw,framerate={fps}/1")
+    } else {
+        eprintln!("linksy-screen: no capssetter (gst-plugins-good's debug plugin); the camera's frame rate is set with videorate");
+        format!("videorate ! video/x-raw,framerate={fps}/1")
+    }
+}
+
+/// Where the camera's frames go. On the V4L2 device for browsers and Zoom, and to PipeWire
+/// too: the device only says it's a camera while something writes to it (what browsers
+/// need), and PipeWire looked at it before that, so PipeWire apps (OBS's camera source)
+/// would list it blank. An install that lacks one of the two elements keeps the other
+/// (desktop#85: no `v4l2sink` ended the camera at once).
+fn camera_sink(device: Option<&std::path::Path>, v4l2sink: bool, pipewiresink: bool, pipewire: &str) -> Result<String, String> {
+    let device = device.map(|d| format!("v4l2sink device={} sync=false", d.display()));
+    // PipeWire takes no frames while no app reads the camera: they are dropped here, or
+    // the phone's stream would back up behind them
+    let pipewire = format!("queue leaky=downstream max-size-buffers=2 ! {pipewire}");
+    match (device, v4l2sink, pipewiresink) {
+        (Some(device), true, true) => Ok(format!(
+            "tee name=cam ! queue leaky=downstream max-size-buffers=2 ! {device} cam. ! {pipewire}"
+        )),
+        (Some(device), true, false) => {
+            eprintln!("linksy-screen: no pipewiresink (PipeWire's GStreamer plugin); the camera is on the Linksy Camera device only");
+            Ok(device)
+        }
+        (Some(_), false, true) => {
+            eprintln!("linksy-screen: no v4l2sink (gst-plugins-good's video4linux2 plugin); the camera is offered to PipeWire apps only, not to browsers or Zoom");
+            Ok(format!("tee ! {pipewire}"))
+        }
+        (None, _, true) => Ok(format!("tee ! {pipewire}")),
+        (Some(_), false, false) => Err(missing("no v4l2sink and no pipewiresink: install gst-plugins-good and PipeWire's GStreamer plugin")),
+        (None, _, false) => Err(missing("no pipewiresink: install PipeWire's GStreamer plugin")),
+    }
+}
+
 /// The receiving end of a camera session: decode and offer it as a camera for as long as
 /// the stream lasts: on the Linksy Camera device when there is one, else to PipeWire apps.
 fn webcam(socket: &std::path::Path, name: &str, fps: u32) -> Result<(), String> {
@@ -532,7 +740,7 @@ fn webcam(socket: &std::path::Path, name: &str, fps: u32) -> Result<(), String> 
     let decoder = ["avdec_h264", "vah264dec", "openh264dec"]
         .into_iter()
         .find(|d| gst::ElementFactory::make(d).build().is_ok())
-        .ok_or("no H.264 decoder: install gstreamer1-plugin-openh264 or gstreamer1-plugin-libav")?;
+        .ok_or_else(|| missing("no H.264 decoder: install GStreamer's openh264 or libav plugin"))?;
     let decoder = low_latency(decoder);
     // Offered the way webcams are, YUY2 at a fixed rate (what the phone sends: 30 or 60):
     // apps like OBS list a camera's formats and rates from this, and skip what they can't
@@ -543,21 +751,13 @@ fn webcam(socket: &std::path::Path, name: &str, fps: u32) -> Result<(), String> 
         "pipewiresink mode=provide sync=false \
          stream-properties=\"props,media.class=Video/Source,media.role=Camera,node.name=linksy-camera,node.description=\\\"{name}\\\"\""
     );
-    // On the V4L2 device for browsers and Zoom, and to PipeWire too: the device only says
-    // it's a camera while something writes to it (what browsers need), and PipeWire looked
-    // at it before that, so PipeWire apps (OBS's camera source) would list it blank.
-    let sink = match camera_device() {
-        Some(dev) => format!(
-            "tee name=cam ! queue leaky=downstream max-size-buffers=2 ! v4l2sink device={} sync=false \
-             cam. ! queue leaky=downstream max-size-buffers=2 ! {pipewire}",
-            dev.display()
-        ),
-        None => pipewire,
-    };
+    let has = |element: &str| gst::ElementFactory::find(element).is_some();
+    let sink = camera_sink(camera_device().as_deref(), has("v4l2sink"), has("pipewiresink"), &pipewire)?;
     let description = format!(
         "fdsrc fd={} ! h264parse ! {decoder} ! videoconvert ! video/x-raw,format=YUY2 \
-         ! capssetter caps=video/x-raw,framerate={fps}/1 ! {sink}",
-        input.as_raw_fd()
+         ! {} ! {sink}",
+        input.as_raw_fd(),
+        fixed_rate(fps)
     );
     let result = play(&description);
     drop(input);
@@ -581,15 +781,14 @@ fn share_mic(socket: &std::path::Path, test: bool) -> Result<(), String> {
 /// The receiving end of a microphone session: offer the audio to every app as a
 /// microphone for as long as it lasts. A leaky queue keeps the delay at most 100 ms: after a
 /// Wi-Fi hiccup, late audio is dropped rather than played late forever.
-fn microphone(socket: &std::path::Path, name: &str) -> Result<(), String> {
+/// A phone's sound on this computer's speakers. Short buffers and a queue that drops the old
+/// when the sound comes in bursts, so what is heard is never seconds behind the screen.
+fn speaker(socket: &std::path::Path, test: bool) -> Result<(), String> {
     let input = UnixStream::connect(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
-    let name: String = name.chars().filter(|c| !matches!(c, '"' | '\\' | ',')).collect();
-    // Audio/Source, not Audio/Source/Virtual: PipeWire 1.6 crashes the stream with the latter.
+    let sink = if test { "fakesink sync=false" } else { "autoaudiosink sync=false" };
     let description = format!(
-        "fdsrc fd={} ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=48000 num-channels=1 \
-         ! queue max-size-time=100000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! audioconvert \
-         ! pipewiresink mode=provide sync=false \
-         stream-properties=\"props,media.class=Audio/Source,node.name=linksy-mic,node.description=\\\"{name}\\\"\"",
+        "fdsrc fd={} ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=48000 num-channels=2 \
+         ! queue max-size-time=120000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! audioconvert ! audioresample ! {sink}",
         input.as_raw_fd()
     );
     let result = play(&description);
@@ -597,13 +796,74 @@ fn microphone(socket: &std::path::Path, name: &str) -> Result<(), String> {
     result
 }
 
+/// How much louder a phone's microphone is made here. A phone sends what its microphone
+/// hears, without the gain its own recorder adds: measured 13 dB under it (desktop#89).
+/// 12 dB brings a voice level with the recorder's; what would go over is held at full scale.
+const MIC_GAIN_DB: f64 = 12.0;
+
+fn mic_gain() -> String {
+    format!("volume volume={:.3}", 10f64.powf(MIC_GAIN_DB / 20.0))
+}
+
+fn microphone(socket: &std::path::Path, name: &str) -> Result<(), String> {
+    let input = UnixStream::connect(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+    let name: String = name.chars().filter(|c| !matches!(c, '"' | '\\' | ',')).collect();
+    // The service ends this with SIGTERM: the virtual microphone goes with it
+    stop_on_term();
+    // A virtual source that audio is played into. A node published with `mode=provide` stops
+    // delivering on PipeWire 1.6 (desktop#89); that stays the way when there is no pactl.
+    let (sink, _source) = match virtual_mic::VirtualMic::create(&name) {
+        Ok(source) => (virtual_mic::feed(), Some(source)),
+        Err(e) => {
+            eprintln!("linksy-screen: {e}; the microphone is published as a PipeWire node, which stops after a moment on PipeWire 1.6");
+            // Audio/Source, not Audio/Source/Virtual: PipeWire 1.6 crashes the stream with the latter.
+            let node = format!(
+                "pipewiresink mode=provide sync=false \
+                 stream-properties=\"props,media.class=Audio/Source,node.name=linksy-mic,node.description=\\\"{name}\\\"\""
+            );
+            (node, None)
+        }
+    };
+    let description = format!(
+        "fdsrc fd={} ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=48000 num-channels=1 \
+         ! queue max-size-time=100000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! {} ! audioconvert ! {sink}",
+        input.as_raw_fd(),
+        mic_gain()
+    );
+    let result = play(&description);
+    drop(input);
+    result
+}
+
+/// Set by SIGTERM, so a run can end the proper way and put back what it made.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn stop_on_term() {
+    // SAFETY: the handler only stores to an atomic
+    unsafe {
+        libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    }
+}
+
 /// Run a pipeline until it ends or fails.
 fn play(description: &str) -> Result<(), String> {
-    let pipeline = gst::parse::launch(description).map_err(|e| format!("pipeline: {e}"))?;
+    let mut context = gst::ParseContext::new();
+    let pipeline = gst::parse::launch_full(description, Some(&mut context), gst::ParseFlags::empty()).map_err(|e| {
+        let lacking = context.missing_elements();
+        if lacking.is_empty() { format!("pipeline: {e}") } else { missing(format!("GStreamer has no {} here", lacking.join(", "))) }
+    })?;
     pipeline.set_state(gst::State::Playing).map_err(|e| format!("could not start: {e}"))?;
     let bus = pipeline.bus().ok_or("pipeline has no bus")?;
     let result = loop {
-        let Some(msg) = bus.timed_pop(gst::ClockTime::NONE) else { break Ok(()) };
+        if STOP.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+        // Wakes up now and then to look at STOP
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) else { continue };
         match msg.view() {
             gst::MessageView::Eos(_) => break Ok(()),
             gst::MessageView::Error(e) => break Err(format!("{} ({:?})", e.error(), e.debug())),
@@ -612,4 +872,65 @@ fn play(description: &str) -> Result<(), String> {
     };
     let _ = pipeline.set_state(gst::State::Null);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{camera_sink, falls_behind, mic_gain};
+    use std::path::Path;
+
+    #[test]
+    fn a_camera_goes_to_the_device_and_to_pipewire() {
+        let sink = camera_sink(Some(Path::new("/dev/video9")), true, true, "pipewiresink").unwrap();
+        assert!(sink.starts_with("tee name=cam"));
+        assert!(sink.contains("v4l2sink device=/dev/video9"));
+        assert!(sink.ends_with("! pipewiresink"));
+    }
+
+    #[test]
+    fn a_camera_without_v4l2sink_is_still_offered_to_pipewire() {
+        let alone = "tee ! queue leaky=downstream max-size-buffers=2 ! pipewiresink";
+        assert_eq!(camera_sink(Some(Path::new("/dev/video9")), false, true, "pipewiresink").unwrap(), alone);
+        assert_eq!(camera_sink(None, false, true, "pipewiresink").unwrap(), alone);
+        assert_eq!(camera_sink(None, true, true, "pipewiresink").unwrap(), alone);
+    }
+
+    #[test]
+    fn a_camera_without_pipewiresink_is_still_on_the_device() {
+        assert_eq!(camera_sink(Some(Path::new("/dev/video9")), true, false, "pipewiresink").unwrap(), "v4l2sink device=/dev/video9 sync=false");
+    }
+
+    #[test]
+    fn a_camera_with_nowhere_to_go_says_what_to_install() {
+        assert!(camera_sink(Some(Path::new("/dev/video9")), false, false, "pipewiresink").unwrap_err().contains("gst-plugins-good"));
+        assert!(camera_sink(None, true, false, "pipewiresink").unwrap_err().contains("PipeWire"));
+    }
+
+
+    #[test]
+    fn a_phone_microphone_is_made_12_db_louder() {
+        assert_eq!(mic_gain(), "volume volume=3.981");
+    }
+
+    #[test]
+    fn an_encoder_that_keeps_up_stays_at_60() {
+        assert!(!falls_behind(60.0, 59.8));
+        assert!(!falls_behind(60.0, 53.0));
+        // A 144 Hz screen is cut to 60 on purpose
+        assert!(!falls_behind(144.0, 59.9));
+    }
+
+    #[test]
+    fn an_encoder_that_cannot_goes_down_to_30() {
+        assert!(falls_behind(60.0, 40.0));
+        assert!(falls_behind(60.0, 51.0));
+        assert!(falls_behind(144.0, 45.0));
+    }
+
+    #[test]
+    fn a_screen_that_hardly_moves_says_nothing() {
+        // A still desktop sends the keepalive 10 times a second; a video at 30 is already 30
+        assert!(!falls_behind(10.0, 2.0));
+        assert!(!falls_behind(30.0, 20.0));
+    }
 }

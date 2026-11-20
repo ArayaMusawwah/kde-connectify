@@ -43,6 +43,23 @@ pub enum Request {
     OpenUrl { to: String, url: String },
     /// Make a device ring so it can be found (`on`), or stop it.
     Ring { to: String, on: bool },
+    /// Ask a phone to open its camera and send what it takes (§4.23).
+    Snap { to: String },
+    /// "Why can't I see my phone?": what the service can find wrong, with what to do.
+    Doctor,
+    /// A phone's controls (docs/protocol.md §4.24): how they were when it last said, and
+    /// whether its Do Not Disturb follows this computer's.
+    PhoneControls { phone: String },
+    /// Change some of a phone's controls; only what is given. A refusal comes as an event.
+    SetPhoneControls { phone: String, change: linksy_core::ControlsChange },
+    /// Keep a phone's Do Not Disturb and this computer's the same, or stop.
+    SetDndSync { phone: String, on: bool },
+    /// This computer's notifications on a phone (docs/protocol.md §4.25): whether it gets them,
+    /// and which apps stay here.
+    ComputerNotifications { phone: String },
+    SetComputerNotifications { phone: String, on: bool },
+    /// Keep an app's notifications from going to phones, or let them.
+    MuteComputerApp { app: String, muted: bool },
     /// Ask a phone to turn on `feature`: `notifications` (the Inbox) or `gallery`
     /// (docs/protocol.md §4.21).
     TurnOn { to: String, feature: String },
@@ -117,10 +134,8 @@ pub enum Request {
     SetDeckAction { phone: String, action: String, on: bool },
     /// The user's commands, all of them (a new one without an `id`); answers them as saved.
     SetDeckCommands { commands: Vec<DeckCommand> },
-    /// A phone's deck layouts (docs/protocol.md §4.20), as the editor shows them.
-    DeckLayouts { phone: String },
-    /// Save a phone's layouts (checked; their version is set here); answers them as saved.
-    SetDeckLayouts { phone: String, layouts: linksy_core::DeckLayouts },
+    /// Try one command line on this computer, as the deck would; answers how it went.
+    TestDeckCommand { line: String },
     /// Forget the screen this computer's user picked for other devices to see or control,
     /// so the desktop's dialog shows the next time one asks. Answers whether one was kept.
     ForgetScreen,
@@ -330,6 +345,27 @@ impl Default for LockPrefs {
 pub struct DeckPrefs {
     pub actions: Vec<DeckOption>,
     pub commands: Vec<DeckCommand>,
+    /// Ids of actions that are off for this phone but that a tile it saved runs: it asked
+    /// for them (docs/protocol.md §4.26).
+    #[serde(default)]
+    pub asked: Vec<String>,
+    /// What this computer keeps of the phone's layouts; none until it has any.
+    #[serde(default)]
+    pub layout: Option<DeckLayoutInfo>,
+    /// The icon names a command may have (the phone's set), in the order to offer them.
+    #[serde(default)]
+    pub icons: Vec<String>,
+}
+
+/// The layouts a computer keeps for a phone, for the deck's page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeckLayoutInfo {
+    pub version: u64,
+    /// The layout the phone shows.
+    pub name: String,
+    pub layouts: usize,
+    /// When the phone last saved them, in milliseconds since the epoch; none: never.
+    pub saved_at: Option<u64>,
 }
 
 /// An action this computer offers, and whether it's on for the phone asked about.
@@ -346,7 +382,50 @@ pub struct DeckCommand {
     #[serde(default)]
     pub id: String,
     pub name: String,
+    /// What a button runs; what a toggle runs to turn on.
     pub command: String,
+    /// The list it shows in on the phone, as typed; none: "Commands".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// A name from the phone's icon set; none: the phone's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    /// The phone asks "Run <name>?" first.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confirm: bool,
+    #[serde(default)]
+    pub kind: CommandKind,
+    /// A toggle's command to turn off; none: `command` flips it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub off: String,
+    /// A toggle's check: it exits 0 while the toggle is on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// What a command of the user's is on the deck.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    /// Runs when pressed.
+    #[default]
+    Button,
+    /// Turns something on and off, and shows which (docs/protocol.md §4.26).
+    Toggle,
+}
+
+/// A command line tried once, as the user's own shell would run it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandRun {
+    /// How it ended; none if it didn't start or was stopped for taking too long.
+    pub code: Option<i32>,
+    /// The start of what it printed, both streams together.
+    pub output: String,
+    pub timed_out: bool,
 }
 
 /// Where a phone said it is.
@@ -402,6 +481,53 @@ pub enum UsbState {
     /// In accessory mode: the cable carries Linksy once the phone app opens it.
     Accessory,
     Failed,
+}
+
+/// One thing the Connection Doctor found.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Finding {
+    /// `firewall`, `vpn`, `other_network`, `silent`, `asleep`, `never_seen`, `cable_off`,
+    /// `cable_failed` or `fine`.
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    /// What Linksy can do about it, as a button.
+    pub action: Option<FindingAction>,
+}
+
+/// What this computer's notifications on a phone come to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ComputerNotifications {
+    /// This computer can listen for its notifications (not from the Flatpak's sandbox).
+    pub available: bool,
+    /// This phone gets them.
+    pub on: bool,
+    /// Apps whose notifications stay here.
+    pub muted: Vec<String>,
+    /// Apps that notified lately, newest first, to choose from.
+    pub seen: Vec<String>,
+}
+
+/// A phone's controls as the apps show them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PhoneControlsInfo {
+    /// What the phone last said; none until it has, or when it has no controls.
+    pub state: Option<linksy_core::ControlsState>,
+    /// This phone's Do Not Disturb and this computer's follow each other.
+    pub sync_dnd: bool,
+    /// This computer has a Do Not Disturb to follow (GNOME and KDE).
+    pub can_sync: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum FindingAction {
+    /// Open Finish Setup (it opens the firewall).
+    FinishSetup,
+    /// Ask for an address to connect by, starting from this one.
+    ConnectByAddress { address: String },
+    /// Switch the cable on for this phone (`UsbConnect`'s key).
+    UsbConnect { phone: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -587,6 +713,10 @@ pub enum ServerMsg {
     FsProgress {
         fs_progress: FsProgress,
     },
+    /// The user chose Quit in the tray: the service is about to stop, and open windows go with it.
+    Quitting {
+        quitting: bool,
+    },
 }
 
 /// Where Linksy's sockets live: `$XDG_RUNTIME_DIR`, or in a Flatpak, the app's own folder
@@ -654,6 +784,7 @@ pub struct Client {
     history: broadcast::Sender<HistoryEntry>,
     inbox: broadcast::Sender<Conversation>,
     fs_progress: broadcast::Sender<FsProgress>,
+    quitting: broadcast::Sender<()>,
 }
 
 impl Client {
@@ -668,7 +799,8 @@ impl Client {
         let (history, _) = broadcast::channel(128);
         let (inbox, _) = broadcast::channel(128);
         let (fs_progress, _) = broadcast::channel(128);
-        let (p, ev, hist, convs, copies) = (pending.clone(), events.clone(), history.clone(), inbox.clone(), fs_progress.clone());
+        let (quitting, _) = broadcast::channel(4);
+        let (p, ev, hist, convs, copies, quit) = (pending.clone(), events.clone(), history.clone(), inbox.clone(), fs_progress.clone(), quitting.clone());
         tokio::spawn(async move {
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -693,13 +825,16 @@ impl Client {
                     Ok(ServerMsg::FsProgress { fs_progress }) => {
                         let _ = copies.send(fs_progress);
                     }
+                    Ok(ServerMsg::Quitting { .. }) => {
+                        let _ = quit.send(());
+                    }
                     Err(_) => {}
                 }
             }
             // Daemon went away: fail everything still waiting. It's not you, it's the daemon.
             p.lock().unwrap().clear();
         });
-        Ok(Self { writer: tokio::sync::Mutex::new(write), pending, next: AtomicU64::new(1), events, history, inbox, fs_progress })
+        Ok(Self { writer: tokio::sync::Mutex::new(write), pending, next: AtomicU64::new(1), events, history, inbox, fs_progress, quitting })
     }
 
     pub fn events(&self) -> broadcast::Receiver<Event> {
@@ -719,6 +854,11 @@ impl Client {
     /// Copies from and to phones as they go (`fs_copy`, `fs_upload`).
     pub fn fs_progress(&self) -> broadcast::Receiver<FsProgress> {
         self.fs_progress.subscribe()
+    }
+
+    /// The user chose Quit in the tray: service is about to stop.
+    pub fn quitting(&self) -> broadcast::Receiver<()> {
+        self.quitting.subscribe()
     }
 
     pub async fn inbox(&self) -> Result<Vec<Conversation>, ClientError> {
@@ -800,6 +940,38 @@ impl Client {
 
     pub async fn ring(&self, to: impl Into<String>, on: bool) -> Result<(), ClientError> {
         self.call(Request::Ring { to: to.into(), on }).await
+    }
+
+    pub async fn doctor(&self) -> Result<Vec<Finding>, ClientError> {
+        self.call(Request::Doctor).await
+    }
+
+    pub async fn phone_controls(&self, phone: impl Into<String>) -> Result<PhoneControlsInfo, ClientError> {
+        self.call(Request::PhoneControls { phone: phone.into() }).await
+    }
+
+    pub async fn set_phone_controls(&self, phone: impl Into<String>, change: linksy_core::ControlsChange) -> Result<(), ClientError> {
+        self.call(Request::SetPhoneControls { phone: phone.into(), change }).await
+    }
+
+    pub async fn set_dnd_sync(&self, phone: impl Into<String>, on: bool) -> Result<(), ClientError> {
+        self.call(Request::SetDndSync { phone: phone.into(), on }).await
+    }
+
+    pub async fn computer_notifications(&self, phone: impl Into<String>) -> Result<ComputerNotifications, ClientError> {
+        self.call(Request::ComputerNotifications { phone: phone.into() }).await
+    }
+
+    pub async fn set_computer_notifications(&self, phone: impl Into<String>, on: bool) -> Result<(), ClientError> {
+        self.call(Request::SetComputerNotifications { phone: phone.into(), on }).await
+    }
+
+    pub async fn mute_computer_app(&self, app: impl Into<String>, muted: bool) -> Result<(), ClientError> {
+        self.call(Request::MuteComputerApp { app: app.into(), muted }).await
+    }
+
+    pub async fn snap(&self, to: impl Into<String>) -> Result<(), ClientError> {
+        self.call(Request::Snap { to: to.into() }).await
     }
 
     pub async fn turn_on(&self, to: impl Into<String>, feature: impl Into<String>) -> Result<(), ClientError> {
@@ -931,12 +1103,8 @@ impl Client {
         self.call(Request::SetDeckCommands { commands }).await
     }
 
-    pub async fn deck_layouts(&self, phone: impl Into<String>) -> Result<linksy_core::DeckLayouts, ClientError> {
-        self.call(Request::DeckLayouts { phone: phone.into() }).await
-    }
-
-    pub async fn set_deck_layouts(&self, phone: impl Into<String>, layouts: linksy_core::DeckLayouts) -> Result<linksy_core::DeckLayouts, ClientError> {
-        self.call(Request::SetDeckLayouts { phone: phone.into(), layouts }).await
+    pub async fn test_deck_command(&self, line: impl Into<String>) -> Result<CommandRun, ClientError> {
+        self.call(Request::TestDeckCommand { line: line.into() }).await
     }
 
     pub async fn forget_screen(&self) -> Result<bool, ClientError> {

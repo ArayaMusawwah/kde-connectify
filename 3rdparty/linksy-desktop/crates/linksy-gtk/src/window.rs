@@ -4,14 +4,17 @@
 
 mod camera;
 mod commands;
+mod controls;
 mod corner;
 mod deck;
+mod doctor;
 mod files;
 mod gallery;
 mod island;
 mod transfers;
 mod invite;
 mod messages;
+mod onboarding;
 mod news;
 mod upgrade;
 mod page;
@@ -35,6 +38,7 @@ use linksy_ipc::{Client, CommandEntry, HistoryEntry, Shared};
 use linksy_i18n::t;
 
 use crate::bridge::{Bridge, Update};
+use controls::controls_what;
 use crate::{fmt, mark};
 
 /// Progress of a running transfer, kept across page rebuilds.
@@ -81,6 +85,8 @@ struct State {
     download_dir: Option<PathBuf>,
     port: Option<u16>,
     invite_dialog: Option<adw::Dialog>,
+    /// The first run's welcome, while it covers the window.
+    onboarding: Option<Rc<onboarding::Onboarding>>,
     /// The Add Device dialog's nearby list and its empty label, while it's open.
     invite_nearby: Option<(gtk::ListBox, gtk::Label)>,
     /// The session in which this device shares its screen, if any.
@@ -105,9 +111,9 @@ struct State {
     pictures_checked: std::collections::HashSet<Fingerprint>,
     /// The camera preview on screen: whose camera, and the pipeline reading it.
     preview: Option<(Fingerprint, gstreamer::Element)>,
-    /// Whose deck page shows, and its editor.
+    /// Whose deck page shows, and the page.
     deck: Option<Fingerprint>,
-    deck_editor: Option<Rc<deck::Editor>>,
+    deck_view: Option<Rc<deck::DeckView>>,
     /// Opening Linksy starts its service once, if it isn't running.
     started_service: bool,
     restarted_service: bool,
@@ -117,6 +123,10 @@ struct State {
     moving: Vec<transfers::Moving>,
     recent: Vec<HistoryEntry>,
     direct: HashMap<Fingerprint, bool>,
+    /// Each phone's controls as last known, and whether its Do Not Disturb follows this computer's.
+    controls: HashMap<Fingerprint, linksy_ipc::PhoneControlsInfo>,
+    /// Whether this computer's notifications go to each phone.
+    forward: HashMap<Fingerprint, linksy_ipc::ComputerNotifications>,
 }
 
 pub struct Window {
@@ -124,6 +134,8 @@ pub struct Window {
     bridge: Bridge,
     state: RefCell<State>,
     toasts: adw::ToastOverlay,
+    /// Over the whole window: the corner's panel, and the first run's welcome.
+    overlay: gtk::Overlay,
     stack: gtk::Stack,
     /// "Studio is watching your screen" with Stop.
     sharing_banner: adw::Banner,
@@ -335,6 +347,7 @@ impl Window {
             bridge: Bridge::new(),
             state: RefCell::default(),
             toasts,
+            overlay,
             stack,
             sharing_banner,
             split,
@@ -379,7 +392,7 @@ impl Window {
                 island::Pick::Transfers => w.open_transfers(),
                 island::Pick::Send(id) => w.choose_files_for(id),
                 island::Pick::AddDevice => w.show_invite(),
-                island::Pick::PairAddress => w.ask_pair_address(),
+                island::Pick::PairAddress => w.ask_pair_address(""),
                 island::Pick::UsbCable => w.show_usb_cable(),
             }
         });
@@ -430,7 +443,7 @@ impl Window {
         win.camera_back.connect_clicked(move |_| {
             let Some(w) = w.upgrade() else { return };
             if w.state.borrow().deck.is_some() {
-                w.leave_deck();
+                w.back_from_deck();
             } else {
                 w.stop_preview();
                 w.render_page();
@@ -487,8 +500,9 @@ impl Window {
             }
         });
         win.refresh_setup();
-        // One thing at a time: Finish Setup when it's needed, otherwise what's new
-        if !win.offer_setup() {
+        // One thing at a time: the welcome on a first run (Finish Setup is one of its
+        // slides), else Finish Setup when it's needed, otherwise what's new
+        if !win.offer_onboarding() && !win.offer_setup() {
             win.offer_news();
         }
         let w = win.clone();
@@ -512,7 +526,8 @@ impl Window {
 
     fn setup_actions(self: &Rc<Self>) {
         type Run = fn(&Rc<Window>);
-        let actions: [(&str, Run); 15] = [
+        let actions: [(&str, Run); 17] = [
+            ("onboarding", |w| w.show_onboarding()),
             ("choose-files", |w| w.choose_files()),
             ("transfers", |w| w.open_transfers()),
             ("commands", |w| w.open_commands()),
@@ -529,7 +544,8 @@ impl Window {
             ("upgrade", |w| w.show_upgrade()),
             ("usb-cable", |w| w.show_usb_cable()),
             ("add-device", |w| w.show_invite()),
-            ("pair-address", |w| w.ask_pair_address()),
+            ("pair-address", |w| w.ask_pair_address("")),
+            ("doctor", |w| w.show_doctor()),
             ("preview-camera", |w| {
                 let on = w.state.borrow().camera;
                 match on.and_then(|(_, id)| w.device(&id)) {
@@ -615,6 +631,10 @@ impl Window {
                 page::Action::AutoAccept(on) => w.auto_accept(id, on),
                 page::Action::AllowScreen(on) => w.allow_screen(id, on),
                 page::Action::Locate => w.locate(id),
+                page::Action::Snap => w.snap(id),
+                page::Action::Controls(change) => w.change_controls(id, change),
+                page::Action::DndSync(on) => w.keep_dnd_in_sync(id, on),
+                page::Action::ForwardNotifications(on) => w.forward_notifications(id, on),
                 page::Action::TurnOn(feature) => w.ask_turn_on(id, feature),
                 page::Action::ViewScreen => w.view_screen(id),
                 page::Action::Extend => w.extend_to(id),
@@ -744,6 +764,12 @@ impl Window {
                             Update::History(h) => w.history_changed(h),
                             Update::Inbox(c) => w.inbox_changed(c),
                             Update::Files(p) => w.files_progress(p),
+                            // Quit in the tray: the window goes with the service
+                            Update::Quitting => {
+                                if let Some(app) = w.window.application() {
+                                    app.quit();
+                                }
+                            }
                         }
                     }
                     // Service went away.
@@ -995,6 +1021,20 @@ impl Window {
         });
     }
 
+    /// Ask a phone to open its camera; the picture arrives as a file and goes on the clipboard.
+    fn snap(self: &Rc<Self>, id: Fingerprint) {
+        let Some(c) = self.client() else { return };
+        let name = self.device(&id).map(|d| d.device.name).unwrap_or_default();
+        let call = self.bridge.call(&c, move |c| async move { c.snap(id.to_string()).await });
+        let w = self.clone();
+        glib::spawn_future_local(async move {
+            match call.await {
+                Ok(()) => w.toast(&t!("Take the picture on {name}, it arrives here", name)),
+                Err(e) => w.toast(&t!("Couldn't ask {name}: {reason}", name, reason = fmt::capitalize(&e))),
+            }
+        });
+    }
+
     /// Ask a phone where it is, then show it, with a map link.
     fn locate(self: &Rc<Self>, id: Fingerprint) {
         let Some(c) = self.client() else { return };
@@ -1111,12 +1151,24 @@ impl Window {
             Event::DeviceFound { .. }
             | Event::DeviceLost { .. }
             | Event::DeviceUpdated { .. }
-            | Event::Connected { .. }
-            | Event::Disconnected { .. } => self.refresh_devices(),
+            | Event::Disconnected { .. } => {
+                if let Event::Disconnected { id } = &ev {
+                    self.state.borrow_mut().controls.remove(id);
+                    self.show_controls();
+                }
+                self.refresh_devices();
+            }
+            Event::Connected { ref device } => {
+                let id = device.id;
+                self.refresh_devices();
+                self.load_controls(id);
+                self.load_forward(id);
+            }
             Event::PairingRequest { request, device, code, incoming, older } => self.show_pairing(request, device, code, incoming, older),
             Event::Paired { device } => {
                 self.close_pair_dialog(&device.id);
                 self.close_invite_dialog();
+                self.onboarding_paired(&device.name);
                 self.toast(&t!("Paired with {name}", name = device.name));
                 // Open the new device's page.
                 self.state.borrow_mut().selected = Some(device.id);
@@ -1235,13 +1287,25 @@ impl Window {
             }
             Event::Heartbeat { .. } | Event::HeartbeatWatch { .. } | Event::ClipboardWatch { .. } | Event::ClipboardFile { .. } => {}
             // The service runs decks and asks phones for their history.
-            Event::DeckOpen { .. } | Event::DeckClose { .. } | Event::DeckRun { .. } | Event::DeckActions { .. } | Event::DeckState { .. } | Event::DeckLayout { .. } => {}
+            Event::DeckOpen { .. } | Event::DeckClose { .. } | Event::DeckRun { .. } | Event::DeckActions { .. } | Event::DeckState { .. } | Event::DeckLayout { .. } | Event::DeckLayoutRefused { .. } | Event::DeckThemeDraft { .. } => {}
+            // The page shows what the phone asked for, so it asks again
+            Event::DeckLayoutSave { from, .. } => self.deck_saved_by(&from.id),
             Event::InboxHistory { .. } | Event::InboxHistoryPage { .. } => {}
             Event::GalleryChanged { from } => self.gallery_changed(&from.id),
             Event::TurnOnRequest { .. } => {}
             // Between the service and phones (USB cable, §4.11)
             Event::UsbPlugged { .. } | Event::UsbConnect { .. } => {}
             // Locate is answered through the service (it waits for the reply).
+            Event::SnapRequest { .. } => {}
+            // A phone's controls (§4.24): the service watches them for the page
+            Event::ControlsState { from, state } => self.controls_said(from.id, state),
+            Event::ControlsRefused { from, what, reason } => self.toast(&t!("{name} didn't change {what}: {reason}", name = from.name, what = controls_what(&what), reason = fmt::capitalize(&reason))),
+            Event::ControlsSet { .. } | Event::ControlsWatch { .. } => {}
+            // A phone's to show (docs/protocol.md §4.25)
+            Event::ComputerNotification { .. } => {}
+            // The service turns a driven phone's taps back (docs/protocol.md §4.11)
+            Event::ScreenRotation { .. } => {}
+            Event::SnapRefused { from, reason } => self.toast(&t!("{name} can't take a picture: {reason}", name = from.name, reason = fmt::capitalize(&reason))),
             Event::LocateRequest { .. } | Event::Location { .. } | Event::LocationRefused { .. } | Event::TerminalListRequest { .. } | Event::Terminals { .. } => {}
             // Answers go to whoever asked (the service waits for them); requests are a phone's.
             Event::SmsMessage { .. }
@@ -1535,6 +1599,8 @@ impl Window {
                 if inbox_on(&d.device) {
                     self.load_inbox(d.device.id);
                 }
+                self.load_controls(d.device.id);
+                self.load_forward(d.device.id);
                 match self.page.tab() {
                     page::Tab::Files => self.files_shown(d.device.id),
                     page::Tab::Gallery if can(&d.device, "gallery") => self.gallery_shown(d.device.id),
@@ -1593,10 +1659,6 @@ impl Window {
         }
         let deck = self.state.borrow().deck;
         if deck.is_some() && deck != selected {
-            let editor = self.state.borrow().deck_editor.clone();
-            if let Some(e) = editor.filter(|e| e.dirty()) {
-                self.toast(&t!("The deck for {device} had changes that weren't saved.", device = e.device()));
-            }
             self.close_deck();
         }
         match self.selected_device() {
@@ -1604,6 +1666,8 @@ impl Window {
                 self.content.set_title(&d.device.name);
                 let locks = self.state.borrow().lock.devices.contains(&d.device.id);
                 self.page.show_device(&d, &staged, locks);
+                self.show_controls();
+                self.show_forward();
                 self.page.show_terminals(&d, self.state.borrow().terminals.as_ref());
                 self.page.avatar.set_custom_image(self.state.borrow().pictures.get(&d.device.id));
                 let camera = self.state.borrow().camera.filter(|(_, id)| *id == d.device.id);
@@ -1710,7 +1774,36 @@ impl Window {
         });
     }
 
+    /// Send `paths` to a device. Through the relay, the slow way, something large is asked
+    /// about first: how much it is, and that it will take a while.
     fn send(self: &Rc<Self>, to: Fingerprint, paths: Vec<PathBuf>) {
+        let device = self.device(&to);
+        if device.as_ref().is_none_or(|d| d.away_relay != Some(true)) {
+            return self.send_now(to, paths);
+        }
+        let name = device.map(|d| d.device.name).unwrap_or_default();
+        let w = self.clone();
+        glib::spawn_future_local(async move {
+            let counted = paths.clone();
+            let size = gio::spawn_blocking(move || linksy_setup::size_of(&counted)).await.unwrap_or(0);
+            if size < linksy_setup::ASK_THROUGH_RELAY {
+                return w.send_now(to, paths);
+            }
+            let alert = adw::AlertDialog::builder()
+                .heading(t!("Send {size} Through the Relay?", size = crate::fmt::size(size)))
+                .body(t!("{device} is away from home and reached through the relay, which is slower than a direct connection. This can take a while.", device = name))
+                .build();
+            alert.add_responses(&[("cancel", t!("Cancel")), ("send", t!("Send"))]);
+            alert.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+            alert.set_default_response(Some("send"));
+            alert.set_close_response("cancel");
+            if alert.choose_future(Some(&w.window)).await == "send" {
+                w.send_now(to, paths);
+            }
+        });
+    }
+
+    fn send_now(self: &Rc<Self>, to: Fingerprint, paths: Vec<PathBuf>) {
         let Some(c) = self.client() else { return };
         let w = self.clone();
         let call = self.bridge.call(&c, move |c| async move { c.send(to.to_string(), paths).await });
@@ -1931,7 +2024,7 @@ impl Window {
     }
 
     /// For networks that block discovery: pair with a device by its IP address.
-    fn ask_pair_address(self: &Rc<Self>) {
+    fn ask_pair_address(self: &Rc<Self>, address: &str) {
         let dialog = adw::AlertDialog::new(Some(t!("Pair by Address")), Some(t!("If a device doesn't show up, enter the address shown in its Linksy Preferences.")));
         let entry = gtk::Entry::builder().placeholder_text("192.168.1.20").activates_default(true).input_purpose(gtk::InputPurpose::Url).build();
         dialog.set_extra_child(Some(&entry));
@@ -1942,6 +2035,7 @@ impl Window {
         dialog.set_response_enabled("pair", false);
         let d = dialog.clone();
         entry.connect_changed(move |e| d.set_response_enabled("pair", fmt::peer_address(&e.text()).is_some()));
+        entry.set_text(address);
         let (w, e) = (self.clone(), entry.clone());
         dialog.connect_response(Some("pair"), move |_, _| {
             let Some(addr) = fmt::peer_address(&e.text()) else { return };
@@ -2118,6 +2212,7 @@ fn main_menu() -> gtk::MenuButton {
     section.append(Some(t!("Add Device…")), Some("win.add-device"));
     section.append(Some(t!("Pair by Address…")), Some("win.pair-address"));
     section.append(Some(t!("Connect by USB Cable…")), Some("win.usb-cable"));
+    section.append(Some(t!("Why Can't I See My Phone?")), Some("win.doctor"));
     section.append(Some(t!("Open Received Files")), Some("app.open-downloads"));
     menu.append_section(None, &section);
     let section = gio::Menu::new();
@@ -2323,7 +2418,7 @@ pub(crate) fn can(d: &DeviceInfo, feature: &str) -> bool {
     if !d.features.is_empty() {
         return d.features.iter().any(|f| f == feature);
     }
-    !(d.os == "android" && matches!(feature, "sms" | "notifications" | "media_state" | "control" | "clipboard_file" | "clipboard_watch" | "microphone" | "locate" | "turn_on"))
+    !(d.os == "android" && matches!(feature, "sms" | "notifications" | "media_state" | "control" | "clipboard_file" | "clipboard_watch" | "microphone" | "locate" | "turn_on" | "snap" | "phone_controls" | "computer_notifications"))
 }
 
 /// Whether a phone shares its messages, for its Inbox.

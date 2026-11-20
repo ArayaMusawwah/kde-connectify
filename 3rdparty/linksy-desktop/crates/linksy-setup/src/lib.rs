@@ -12,6 +12,8 @@ use gio::prelude::*;
 use linksy_i18n::t;
 pub use linksy_host::pkexec::Prompt;
 
+pub mod pieces;
+
 /// Which window asks: they show video with different GStreamer sinks.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Ui {
@@ -487,6 +489,19 @@ fn stop_portal_autostart() {
     );
 }
 
+/// For the Connection Doctor: a finding when the firewall would keep devices out of Linksy.
+pub fn firewall_finding() -> Option<linksy_ipc::Finding> {
+    if firewall_need()? == Need::Ready {
+        return None;
+    }
+    Some(linksy_ipc::Finding {
+        id: "firewall".into(),
+        title: t!("The firewall may be keeping devices out").into(),
+        detail: t!("Linksy's port and device discovery aren't open in this computer's firewall. Finish Setup opens them (it asks for your password).").into(),
+        action: Some(linksy_ipc::FindingAction::FinishSetup),
+    })
+}
+
 /// What this computer has and lacks, right now, for the `ui` window.
 pub fn check(ui: Ui) -> Vec<Item> {
     let fam = family();
@@ -520,6 +535,18 @@ pub fn check(ui: Ui) -> Vec<Item> {
         why: t!("Browsers, Zoom and Discord only see this kind of camera. Without it, the phone's camera works in OBS and PipeWire apps only."),
         need: camera,
     }];
+    // The Flatpak's way out of its sandbox can be switched off (Flatseal, a build without it)
+    if !linksy_host::host_access() {
+        items.insert(
+            0,
+            Item {
+                id: "host-access",
+                title: t!("Access to Your Computer"),
+                why: t!("Without it, this Flatpak can't use your picture or the cover of what's playing, and Finish Setup can't change anything here."),
+                need: Need::Manual(t!("Allow it with: flatpak override --user --talk-name=org.freedesktop.Flatpak mg.diary.linksy.Linksy (or in Flatseal, under Session Bus), then restart Linksy.")),
+            },
+        );
+    }
     items.push(Item {
         id: "usb",
         title: t!("Phones by USB Cable"),
@@ -528,32 +555,35 @@ pub fn check(ui: Ui) -> Vec<Item> {
     });
     // In a Flatpak, codecs and tools come with the runtime and the app.
     if !flatpak() {
-        // H.264 both ways, and the window's video sink to show it: GTK's (on openSUSE, in
-        // the gstreamer-plugins-rs bundle) or Qt Quick's.
-        let (mut fedora, mut debian, mut arch, mut suse) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        if !(has_element(&["avdec_h264", "vah264dec", "openh264dec"]) && has_element(&["vah264lpenc", "vah264enc", "x264enc", "openh264enc"])) {
-            fedora.extend(["gstreamer1-plugin-openh264", "gstreamer1-plugin-libav"]);
-            debian.extend(["gstreamer1.0-libav", "gstreamer1.0-plugins-ugly"]);
-            arch.extend(["gst-libav", "gst-plugins-ugly"]);
-            suse.extend(["gstreamer-plugin-openh264", "gstreamer-plugins-libav"]);
-        }
+        // What is missing of some pieces, as the packages that bring it, per family
+        let lacking = |wanted: &[&pieces::Piece]| {
+            let mut lists: [Vec<&'static str>; 4] = Default::default();
+            for p in wanted.iter().filter(|p| !has_element(p.elements)) {
+                for (list, names) in lists.iter_mut().zip([p.fedora, p.debian, p.arch, p.suse]) {
+                    for name in names {
+                        if !list.contains(name) {
+                            list.push(name);
+                        }
+                    }
+                }
+            }
+            lists
+        };
+        let need = |lists: &[Vec<&'static str>; 4], manual: &'static str| if lists[0].is_empty() { Need::Ready } else { pick(&lists[0], &lists[1], &lists[2], &lists[3], manual) };
+        // H.264 both ways, what reads it and writes the camera's device (a tarball installs
+        // neither, and the camera closed at once without them: desktop#85), and the window's
+        // video sink: GTK's (on openSUSE, in the gstreamer-plugins-rs bundle) or Qt Quick's.
+        let mut video = vec![&pieces::BASE, &pieces::H264_DECODER, &pieces::H264_ENCODER, &pieces::H264_PARSE, &pieces::CAMERA_DEVICE];
         match ui {
             // Ubuntu 24.04 has no package for it: the app draws frames itself there
-            Ui::Gtk if !has_element(&["gtk4paintablesink"]) && !(family() == Family::Debian && !apt_has("gstreamer1.0-gtk4")) => {
-                fedora.push("gstreamer1-plugin-gtk4");
-                debian.push("gstreamer1.0-gtk4");
-                arch.push("gst-plugin-gtk4");
-                suse.push("gstreamer-plugins-rs");
-            }
-            Ui::Qt if !has_element(&["qml6glsink"]) => {
-                fedora.push("gstreamer1-plugins-good-qt6");
-                debian.push("gstreamer1.0-qt6");
-                arch.push("gst-plugin-qml6");
-                suse.push("gstreamer-plugins-good-qtqml6");
-            }
+            Ui::Gtk if !(fam == Family::Debian && !apt_has("gstreamer1.0-gtk4")) => video.push(&pieces::GTK_SINK),
+            Ui::Qt => video.push(&pieces::QT_SINK),
             _ => {}
         }
+        let codecs = has_element(pieces::H264_DECODER.elements) && has_element(pieces::H264_ENCODER.elements);
+        let sets = !has_element(pieces::H264_PARSE.elements) || !has_element(pieces::CAMERA_DEVICE.elements);
         let manual = match ui {
+            _ if codecs && sets => t!("Install GStreamer's good and bad plugin sets (for v4l2sink and h264parse) from your distribution."),
             Ui::Gtk => t!("Install GStreamer's H.264 plugins (openh264 or libav) and its GTK 4 video sink (gtk4paintablesink) from your distribution."),
             Ui::Qt => t!("Install GStreamer's H.264 plugins (openh264 or libav) and its Qt 6 video sink (qml6glsink) from your distribution."),
         };
@@ -561,25 +591,18 @@ pub fn check(ui: Ui) -> Vec<Item> {
             id: "video",
             title: t!("Video for Screens and Cameras"),
             why: t!("To send and show screens, second displays and the phone's camera."),
-            need: if fedora.is_empty() { Need::Ready } else { pick(&fedora, &debian, &arch, &suse, manual) },
+            need: need(&lacking(&video), manual),
         });
-        let (mut fedora, mut debian, mut arch, mut suse) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        if !has_element(&["pipewiresrc"]) {
-            fedora.push("pipewire-gstreamer");
-            debian.push("gstreamer1.0-pipewire");
-            arch.push("gst-plugin-pipewire");
-            suse.push("gstreamer-plugin-pipewire");
-        }
-        if x11() {
-            // No portal works on X11: Linksy reads the display itself (#67)
-            if !has_element(&["ximagesrc"]) {
-                fedora.push("gstreamer1-plugins-good");
-                debian.push("gstreamer1.0-plugins-good");
-                arch.push("gst-plugins-good");
-                suse.push("gstreamer-plugins-good");
-            }
-        } else if !screencast_portal() {
-            for list in [&mut fedora, &mut debian, &mut arch, &mut suse] {
+        items.push(Item {
+            id: "audio",
+            title: t!("Microphone and Sound"),
+            why: t!("Playing the phone's sound here, and sending this computer's microphone to it."),
+            need: need(&lacking(&[&pieces::BASE, &pieces::SOUND, &pieces::MIC_BUFFERS]), t!("Install GStreamer's good and bad plugin sets from your distribution.")),
+        });
+        // No portal works on X11: Linksy reads the display itself (#67)
+        let mut screen = lacking(&if x11() { vec![&pieces::PIPEWIRE, &pieces::X11_SCREEN] } else { vec![&pieces::PIPEWIRE] });
+        if !x11() && !screencast_portal() {
+            for list in &mut screen {
                 list.push(portal_package());
             }
         }
@@ -587,7 +610,7 @@ pub fn check(ui: Ui) -> Vec<Item> {
             id: "pipewire",
             title: t!("Screen Sharing"),
             why: t!("Reading this computer's screen, and offering the phone's camera to apps."),
-            need: if fedora.is_empty() { Need::Ready } else { pick(&fedora, &debian, &arch, &suse, t!("Install PipeWire's GStreamer plugin and your desktop's screen sharing portal.")) },
+            need: need(&screen, t!("Install PipeWire's GStreamer plugin and your desktop's screen sharing portal.")),
         });
         // Fedora's AMD video driver leaves H.264 encoding out (patents): RPM Fusion's full one
         // lets the GPU encode a second display at up to 60 fps, instead of the CPU at 30
@@ -734,12 +757,17 @@ pub fn step_text(step: &str) -> String {
     }
 }
 
+/// Lines of the helper's output kept for the setup log.
+const TRANSCRIPT_LINES: usize = 400;
+
 /// Reads the helper's output as it comes: steps to show, the Secure Boot code, and the last
 /// lines for when it fails.
 #[derive(Default)]
 pub struct Progress {
     enroll: Option<String>,
     last: std::collections::VecDeque<String>,
+    /// All of it but the Secure Boot code, the newest lines, for the setup log.
+    transcript: std::collections::VecDeque<String>,
     /// pkexec had nobody to ask for the password, not even on its terminal.
     no_agent: bool,
     timed_out: bool,
@@ -749,6 +777,12 @@ pub struct Progress {
 impl Progress {
     /// One line of output; the step to show now, if it is one.
     pub fn line(&mut self, line: &str) -> Option<String> {
+        if !line.trim().is_empty() {
+            self.transcript.push_back(if line.starts_with("ENROLL ") { "ENROLL (code left out)".into() } else { line.trim_end().to_string() });
+            if self.transcript.len() > TRANSCRIPT_LINES {
+                self.transcript.pop_front();
+            }
+        }
         if let Some(step) = line.strip_prefix("STEP ") {
             return Some(t!("{step}…", step = step_text(step)));
         }
@@ -766,6 +800,20 @@ impl Progress {
         None
     }
 
+    /// Everything the helper printed, to keep.
+    pub fn transcript(&self) -> String {
+        self.transcript.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
+    }
+
+    /// pkexec's 127 is also the helper that can't be run; its message says so, unlike the
+    /// ones about the password.
+    fn explains_itself(&self) -> bool {
+        self.last.back().is_some_and(|l| {
+            let l = l.to_lowercase();
+            !l.contains("authoriz") && !l.contains("authentic") && !l.contains("password")
+        })
+    }
+
     /// What the helper's exit status means.
     pub fn finish(self, status: i32) -> Result<(), Failure> {
         match status {
@@ -774,6 +822,7 @@ impl Progress {
             _ if self.wrong => Err(Failure::Message(t!("Not set up: the password didn't work.").into())),
             _ if self.no_agent => Err(no_agent()),
             4 => Err(Failure::Restart(self.enroll)),
+            127 if self.explains_itself() => Err(Failure::Message(t!("Setup didn't finish: {details}", details = self.last.into_iter().collect::<Vec<_>>().join(" ")))),
             126 | 127 => Err(Failure::Message(t!("Not set up: the password wasn't given.").into())),
             _ => Err(Failure::Message(t!("Setup didn't finish: {details}", details = self.last.into_iter().collect::<Vec<_>>().join(" ")))),
         }
@@ -810,6 +859,7 @@ pub fn run_as_root(args: &[String], ask: impl FnMut(&Prompt) -> Option<String>, 
     .map_err(|e| Failure::Message(e.to_string()))?;
     progress.timed_out = outcome.timed_out;
     progress.wrong = outcome.wrong;
+    linksy_logs::record_setup(&args.join(" "), outcome.code, &progress.transcript());
     progress.finish(outcome.code)
 }
 
@@ -952,6 +1002,56 @@ pub fn set_watches_only(device: &str, on: bool) {
     let _ = std::fs::write(&path, ids.join("\n"));
 }
 
+/// Where the phone's app is downloaded: always the newest.
+pub const PHONE_APP: &str = "https://linksy.diary.mg/download/android";
+
+/// From this size on, both apps ask before sending through the relay: it is the slow way,
+/// and what it may carry in a month is shared by everyone.
+pub const ASK_THROUGH_RELAY: u64 = 200_000_000;
+
+/// What `paths` weigh together, folders walked. Links aren't followed, and counting stops
+/// at 100,000 entries: past that the answer is "a lot" either way.
+pub fn size_of(paths: &[PathBuf]) -> u64 {
+    let mut left = 100_000u32;
+    let mut pending: Vec<PathBuf> = paths.to_vec();
+    let mut total = 0u64;
+    while let Some(path) = pending.pop() {
+        if left == 0 {
+            break;
+        }
+        left -= 1;
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.is_dir() {
+            pending.extend(std::fs::read_dir(&path).into_iter().flatten().flatten().map(|e| e.path()));
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Whether to show the welcome: on a computer where Linksy was never used
+/// (`used_before`, the service's data), once. `LINKSY_ONBOARDING=1` shows it anyway, for
+/// trying it; screenshots and development setups never get it otherwise.
+pub fn onboarding_due(used_before: bool) -> bool {
+    if std::env::var_os("LINKSY_ONBOARDING").is_some() {
+        return true;
+    }
+    if std::env::var_os("LINKSY_SCREENSHOT").is_some() || std::env::var_os("LINKSY_SOCKET").is_some() {
+        return false;
+    }
+    !used_before && !config_file("onboarded").exists()
+}
+
+/// The welcome was seen (or skipped): never again.
+pub fn set_onboarded() {
+    let path = config_file("onboarded");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, env!("CARGO_PKG_VERSION"));
+}
+
 /// The first time each `version` starts with something to set up: true once, to offer it.
 pub fn offer_now(ui: Ui, version: &str) -> bool {
     if std::env::var_os("LINKSY_SCREENSHOT").is_some() || std::env::var_os("LINKSY_SOCKET").is_some() {
@@ -989,11 +1089,58 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_weighs_its_files_and_what_its_folders_hold() {
+        let dir = std::env::temp_dir().join(format!("linksy-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("album/inner")).unwrap();
+        std::fs::write(dir.join("one"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.join("album/two"), vec![0u8; 300]).unwrap();
+        std::fs::write(dir.join("album/inner/three"), vec![0u8; 50]).unwrap();
+        // A link to the big file is not counted again
+        std::os::unix::fs::symlink(dir.join("one"), dir.join("album/link")).unwrap();
+        assert_eq!(size_of(&[dir.join("one"), dir.join("album")]), 1350);
+        assert_eq!(size_of(&[dir.join("missing")]), 0);
+        assert_eq!(size_of(&[]), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn progress_reads_steps_and_codes() {
         let mut p = Progress::default();
         assert!(p.line("STEP Making the Linksy Camera").is_some());
         assert!(p.line("ENROLL 12345678").is_none());
         assert!(matches!(p.finish(4), Err(Failure::Restart(Some(c))) if c == "12345678"));
+    }
+
+    #[test]
+    fn a_helper_that_could_not_run_says_why() {
+        let mut p = Progress::default();
+        p.line("Error executing command as another user: No such file or directory");
+        assert!(matches!(p.finish(127), Err(Failure::Message(m)) if m.contains("No such file or directory")));
+        // About the password: the password's message
+        let mut p = Progress::default();
+        p.line("Error executing command as another user: Not authorized");
+        assert!(matches!(p.finish(127), Err(Failure::Message(m)) if !m.contains("Not authorized")));
+        assert!(matches!(Progress::default().finish(127), Err(Failure::Message(_))));
+        // Cancelled
+        let mut p = Progress::default();
+        p.line("something printed before");
+        assert!(matches!(p.finish(126), Err(Failure::Message(m)) if !m.contains("something printed before")));
+    }
+
+    #[test]
+    fn the_transcript_keeps_everything_but_the_secure_boot_code() {
+        let mut p = Progress::default();
+        p.line("STEP Making the Linksy Camera");
+        p.line("");
+        p.line("ENROLL 12345678");
+        p.line("v4l2loopback-ctl: no such option");
+        assert_eq!(p.transcript(), "STEP Making the Linksy Camera\nENROLL (code left out)\nv4l2loopback-ctl: no such option");
+        for i in 0..TRANSCRIPT_LINES + 10 {
+            p.line(&format!("line {i}"));
+        }
+        assert_eq!(p.transcript().lines().count(), TRANSCRIPT_LINES);
+        assert!(p.transcript().ends_with(&format!("line {}", TRANSCRIPT_LINES + 9)));
     }
 
     #[test]

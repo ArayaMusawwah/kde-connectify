@@ -138,7 +138,10 @@ async fn act(service: &Service, action: Action) {
             crate::sessions::open_window(&service.socket);
             return;
         }
-        Action::Quit => (None, service.ask(Request::Quit).await),
+        Action::Quit => {
+            crate::ipc::announce_quit().await;
+            (None, service.ask(Request::Quit).await)
+        }
         Action::SendFiles(d) => match pick_files(&t!("Send to {name}", name = d.name)).await {
             Some(paths) if !paths.is_empty() => (Some(d.name), service.ask(Request::Send { to: d.id.to_string(), paths }).await),
             _ => return,
@@ -251,6 +254,7 @@ fn session_title(s: &ActiveSession) -> String {
         SessionKind::Camera => t!("{name}'s camera is on: “{camera}” in your apps", name, camera = format!("Linksy Camera ({name})")),
         SessionKind::Microphone if s.sharing => t!("{name} is using your microphone", name),
         SessionKind::Microphone => t!("{name}'s microphone is on: “{microphone}” in your apps", name, microphone = format!("Linksy Microphone ({name})")),
+        SessionKind::Sound => t!("{name}'s sound is playing here", name),
         SessionKind::Display => t!("{name} is your second display", name),
         SessionKind::Control => t!("{name} is controlling your screen", name),
         SessionKind::Input => t!("{name} is your touchpad and keyboard", name),

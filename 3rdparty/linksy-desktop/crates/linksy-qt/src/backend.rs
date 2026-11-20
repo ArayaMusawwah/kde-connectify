@@ -205,6 +205,16 @@ pub mod qobject {
         #[cxx_name = "setupChecked"]
         fn setup_checked(self: Pin<&mut Backend>, json: QString);
 
+        /// Whether the firewall would keep devices out, for the Connection Doctor;
+        /// `firewallChecked` answers with a finding (JSON), or "" when it is fine.
+        #[qinvokable]
+        #[cxx_name = "checkFirewall"]
+        fn check_firewall(self: Pin<&mut Self>);
+
+        #[qsignal]
+        #[cxx_name = "firewallChecked"]
+        fn firewall_checked(self: Pin<&mut Backend>, json: QString);
+
         #[qsignal]
         #[cxx_name = "setupStep"]
         fn setup_step(self: Pin<&mut Backend>, text: QString);
@@ -236,6 +246,34 @@ pub mod qobject {
         #[cxx_name = "setWatchesOnly"]
         fn set_watches_only(&self, device: &QString, on: bool);
 
+        /// What a selection of files and folders weighs, in bytes (`paths`: a JSON list).
+        #[qinvokable]
+        #[cxx_name = "pathsSize"]
+        fn paths_size(&self, paths: &QString) -> f64;
+
+        /// From this size on, sending through the relay is asked about first.
+        #[qinvokable]
+        #[cxx_name = "askThroughRelay"]
+        fn ask_through_relay(&self) -> f64;
+
+        /// Whether this is the first run here: show the welcome (shared with the GTK app).
+        #[qinvokable]
+        #[cxx_name = "onboardingDue"]
+        fn onboarding_due(&self) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "setOnboarded"]
+        fn set_onboarded(&self);
+
+        /// Where the phone's app is downloaded.
+        #[qinvokable]
+        #[cxx_name = "phoneApp"]
+        fn phone_app(&self) -> QString;
+
+        /// Linksy's mark as an image source: there whatever the icon theme has.
+        #[qinvokable]
+        fn logo(&self) -> QString;
+
         #[qsignal]
         fn reply(self: Pin<&mut Backend>, id: i32, ok: bool, json: QString);
 
@@ -257,6 +295,10 @@ pub mod qobject {
         /// Couldn't reach the service, or it went away.
         #[qsignal]
         fn offline(self: Pin<&mut Backend>, why: QString);
+
+        /// The user chose Quit in the tray: the window closes with the service.
+        #[qsignal]
+        fn quitting(self: Pin<&mut Backend>);
     }
 
     impl cxx_qt::Threading for Backend {}
@@ -333,7 +375,7 @@ impl qobject::Backend {
                 b.as_mut().set_starting(false);
                 b.as_mut().set_connected(true);
             });
-            let (mut events, mut history, mut inbox, mut copies) = (client.events(), client.history_updates(), client.inbox_updates(), client.fs_progress());
+            let (mut events, mut history, mut inbox, mut copies, mut quitting) = (client.events(), client.history_updates(), client.inbox_updates(), client.fs_progress(), client.quitting());
             use tokio::sync::broadcast::error::RecvError;
             loop {
                 tokio::select! {
@@ -365,6 +407,13 @@ impl qobject::Backend {
                         Ok(p) => {
                             let json = serde_json::to_string(&p).unwrap_or_default();
                             let _ = thread.queue(move |b| b.fs_progress(QString::from(&json)));
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    },
+                    q = quitting.recv() => match q {
+                        Ok(()) => {
+                            let _ = thread.queue(|b| b.quitting());
                         }
                         Err(RecvError::Lagged(_)) => continue,
                         Err(RecvError::Closed) => break,
@@ -579,6 +628,32 @@ impl qobject::Backend {
         linksy_setup::set_watches_only(&device.to_string(), on);
     }
 
+    pub fn paths_size(&self, paths: &QString) -> f64 {
+        let paths: Vec<std::path::PathBuf> = serde_json::from_str(&paths.to_string()).unwrap_or_default();
+        linksy_setup::size_of(&paths) as f64
+    }
+
+    pub fn ask_through_relay(&self) -> f64 {
+        linksy_setup::ASK_THROUGH_RELAY as f64
+    }
+
+    pub fn onboarding_due(&self) -> bool {
+        linksy_setup::onboarding_due(linksy_news::used_before())
+    }
+
+    pub fn set_onboarded(&self) {
+        linksy_setup::set_onboarded();
+    }
+
+    pub fn phone_app(&self) -> QString {
+        QString::from(linksy_setup::PHONE_APP)
+    }
+
+    pub fn logo(&self) -> QString {
+        let svg = include_str!("../../../data/icons/mg.diary.linksy.Linksy.svg");
+        QString::from(&format!("data:image/svg+xml;utf8,{}", svg.replace('\n', " ").replace('%', "%25").replace('#', "%23")))
+    }
+
     pub fn answer_password(&self, text: &QString, given: bool) {
         if let Some(answer) = self.rust().password.lock().unwrap().take() {
             let _ = answer.send(given.then(|| text.to_string()));
@@ -644,6 +719,15 @@ impl qobject::Backend {
         self.rust().rt.spawn_blocking(move || {
             let state = autostart_state();
             let _ = thread.queue(move |b| b.autostart_checked(state, QString::default()));
+        });
+    }
+
+    pub fn check_firewall(self: Pin<&mut Self>) {
+        let thread = self.qt_thread();
+        // firewall-cmd and polkit: off the Qt thread
+        self.rust().rt.spawn_blocking(move || {
+            let json = linksy_setup::firewall_finding().and_then(|f| serde_json::to_string(&f).ok()).unwrap_or_default();
+            let _ = thread.queue(move |b| b.firewall_checked(QString::from(&json)));
         });
     }
 

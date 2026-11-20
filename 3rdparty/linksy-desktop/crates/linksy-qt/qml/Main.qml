@@ -55,6 +55,8 @@ Kirigami.ApplicationWindow {
     signal alertsChanged(string phone)
     // A phone's photos changed (its page's gallery)
     signal galleryChanged(string phone)
+    // A phone said how its volumes, ringer, Do Not Disturb and flashlight are (its page's controls)
+    signal controlsChanged(string phone, var state)
     // A copy from or to a phone went on, or ended (its page's files)
     signal fsProgress(var progress)
 
@@ -81,6 +83,7 @@ Kirigami.ApplicationWindow {
             // Development aid: open a screen for scripts/qt-shot.sh
             const open = backend.env("LINKSY_SCREENSHOT_OPEN");
             if (open === "invite") root.openInvite();
+            if (open === "onboarding") root.openOnboarding();
             if (open === "prefs") pageStack.pushDialogLayer(Qt.resolvedUrl("PrefsPage.qml"), { app: root });
             if (open === "screen") openScreen.start();
             if (open === "setup") root.openSetup();
@@ -91,6 +94,8 @@ Kirigami.ApplicationWindow {
             if (open === "messages") openMessagesSoon.start();
         }
         onOffline: why => { if (why) root.toast(why) }
+        // Quit in the tray: the window goes with the service
+        onQuitting: Qt.quit()
         onSetupChecked: json => root.setup = JSON.parse(json)
         onAutostartChecked: (state, error) => {
             root.autostart = state;
@@ -241,12 +246,27 @@ Kirigami.ApplicationWindow {
         if (page) page.deckOpen = true;
     }
 
+    // A phone saved its deck: what it asked for may have changed, so its page asks again
+    function deckSaved(id) {
+        const page = pageStack.get(1);
+        if (page && page.deckOpen && page.deviceId === id) page.deckReload();
+    }
+
     function openSetup() {
         pageStack.pushDialogLayer(Qt.resolvedUrl("SetupPage.qml"), { app: root });
     }
 
-    function openInvite() {
+    function openOnboarding() {
+        pageStack.layers.push(Qt.resolvedUrl("OnboardingPage.qml"), { app: root });
+    }
+
+    function openInvite(address) {
+        inviteDialog.addressText = address ?? "";
         inviteDialog.open();
+    }
+
+    function openDoctor() {
+        pageStack.pushDialogLayer(Qt.resolvedUrl("DoctorPage.qml"), { app: root });
     }
 
     // Bring the window forward for a question the service asks
@@ -275,7 +295,7 @@ Kirigami.ApplicationWindow {
     // What a device can do for others; older versions don't say, so assume as the GTK app does
     function can(info, feature) {
         if (info.features && info.features.length) return info.features.includes(feature);
-        return !(info.os === "android" && ["sms", "notifications", "media_state", "control", "clipboard_file", "clipboard_watch", "microphone", "locate", "turn_on"].includes(feature));
+        return !(info.os === "android" && ["sms", "notifications", "media_state", "control", "clipboard_file", "clipboard_watch", "microphone", "locate", "turn_on", "snap", "phone_controls", "computer_notifications"].includes(feature));
     }
 
     function refreshAll() {
@@ -389,6 +409,9 @@ Kirigami.ApplicationWindow {
         case "transfer_request":
             offerDialog.ask(ev.transfer, ev.from, ev.files, ev.total);
             break;
+        case "deck_layout_save":
+            deckSaved(ev.from.id);
+            break;
         case "direct_wanted": case "direct_linked": case "direct_ended": case "direct": {
             const id = ev.type === "direct" ? ev.from.id : ev.id;
             const d = Object.assign({}, direct);
@@ -470,6 +493,17 @@ Kirigami.ApplicationWindow {
         case "ring":
             if (ev.on) toast(t("{name} is looking for this computer", { name: ev.from.name }));
             break;
+        case "controls_state":
+            controlsChanged(ev.from.id, ev.state);
+            break;
+        case "controls_refused": {
+            const what = ({ media: t("the media volume"), ringtone: t("the ringtone volume"), alarm: t("the alarm volume"), ringer: t("the ringer"), dnd: t("Do Not Disturb"), flashlight: t("the flashlight") })[ev.what] ?? ev.what;
+            toast(t("{name} didn't change {what}: {reason}", { name: ev.from.name, what: what, reason: ev.reason.charAt(0).toUpperCase() + ev.reason.slice(1) }));
+            break;
+        }
+        case "snap_refused":
+            toast(t("{name} can't take a picture: {reason}", { name: ev.from.name, reason: ev.reason.charAt(0).toUpperCase() + ev.reason.slice(1) }));
+            break;
         }
     }
 
@@ -545,9 +579,36 @@ Kirigami.ApplicationWindow {
         sendPaths(id, urls.map(u => decodeURIComponent(u.toString().replace(/^file:\/\//, ""))));
     }
 
+    // Through the relay, the slow way, something large is asked about first
     function sendPaths(id, paths) {
         if (!paths.length) return;
+        const d = devices.find(x => x.device.id === id);
+        if (d?.away_relay === true) {
+            const bytes = backend.pathsSize(JSON.stringify(paths));
+            if (bytes >= backend.askThroughRelay()) { relayDialog.ask(id, paths, bytes, d.device.name); return }
+        }
+        sendNow(id, paths);
+    }
+
+    function sendNow(id, paths) {
         request("send", { to: id, paths: paths }, (ok, err) => { if (!ok) toast(err) });
+    }
+
+    Kirigami.PromptDialog {
+        id: relayDialog
+        property string to
+        property var paths: []
+        function ask(id, what, bytes, name) {
+            to = id; paths = what;
+            title = root.t("Send {size} Through the Relay?", { size: root.size(bytes) });
+            subtitle = root.t("{device} is away from home and reached through the relay, which is slower than a direct connection. This can take a while.", { device: name });
+            open();
+        }
+        standardButtons: Kirigami.Dialog.NoButton
+        customFooterActions: [
+            Kirigami.Action { text: root.t("Cancel"); onTriggered: relayDialog.close() },
+            Kirigami.Action { text: root.t("Send"); icon.name: "document-send"; onTriggered: { relayDialog.close(); root.sendNow(relayDialog.to, relayDialog.paths) } }
+        ]
     }
 
     // Files from the file manager (Send with Linksy, Open With): the island asks where to
@@ -899,7 +960,9 @@ Kirigami.ApplicationWindow {
         backend.checkSetup();
         // One thing at a time: Finish Setup when something's missing, otherwise, after an
         // update, what's new
-        if (backend.offerSetup()) root.openSetup();
+        // The welcome on a first run instead: Finish Setup is one of its slides
+        if (backend.onboardingDue()) root.openOnboarding();
+        else if (backend.offerSetup()) root.openSetup();
         else whatsNew.offer();
         // Crashed since last time: offer the logs once
         if (backend.unseenCrash()) showPassiveNotification(t("Linksy Quit Unexpectedly"), "long", t("Save Logs…"), () => root.saveLogs());

@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::apps::{AppInfo, AppProbe, AppSend, DirectReady, MAX_APKS, MAX_PROBES, PreflightMsg, PreflightReply, ReceivedApp, is_apk, received_apps, valid_apps};
 use crate::deck_layout::DeckLayouts;
+use crate::deck_theme::DeckThemeDef;
 use crate::discovery::{Announce, Discovery, DiscoveryEvent, DiscoveryKey};
 use crate::error::{Error, Result, invalid, protocol};
 use crate::identity::{DeviceInfo, DeviceKind, Fingerprint, Identity};
@@ -33,7 +34,7 @@ use crate::gallery::GalleryCall;
 use crate::invite::{self, Invite};
 use crate::preflight::PreflightCall;
 use crate::settings::Settings;
-use crate::protocol::{Battery, CallState, ConversationMessage, DeckAction, DeckState, DirectGroup, DirectStep, PluggedPhone, FsRequest, GalleryRequest, SmsMessage, SmsThread, MediaCommand, MediaState, RemoteNotification, VolumeState,
+use crate::protocol::{Battery, CallState, ControlsChange, ControlsState, ConversationMessage, DeckAction, DeckRefusal, DeckState, DirectGroup, DirectStep, PluggedPhone, FsRequest, GalleryRequest, SmsMessage, SmsThread, MediaCommand, MediaState, RemoteNotification, VolumeState,
     FileEntry, Handshake, Intent, Message, PAIRING_VERSION, PROTOCOL_VERSION, RejectReason, SessionKind, SessionMsg, TransferMsg, read_msg,
     read_value, write_msg,
 };
@@ -53,6 +54,9 @@ pub const MAX_CLIPBOARD: usize = 256 * 1024;
 const MAX_SMS: u32 = 100;
 /// Largest file one device may put on another's clipboard.
 const MAX_CLIPBOARD_FILE: u64 = 10 << 20;
+/// How long a picture asked for with `request_snap` is taken without asking, and its largest size.
+const SNAP_WAIT: Duration = Duration::from_secs(120);
+const MAX_SNAP: u64 = 40 << 20;
 /// Longest link accepted for "Open on PC".
 const MAX_URL: usize = 8 * 1024;
 /// Mirrored notifications: longest key, and largest icon (base64 of a 64 KiB PNG).
@@ -265,6 +269,15 @@ pub enum Event {
     VolumeSet { from: DeviceInfo, level: Option<f64>, muted: Option<bool> },
     /// A device wants this one's `volume_state` while connected (`on`), or no longer.
     VolumeWatch { from: DeviceInfo, on: bool },
+    /// A phone's controls, newest (older ones are dropped here).
+    ControlsState { from: DeviceInfo, state: ControlsState },
+    /// A device asks to change some of this phone's controls (answer with `refuse_controls` for
+    /// one that can't be).
+    ControlsSet { from: DeviceInfo, change: ControlsChange },
+    /// A device wants this one's `controls_state` while connected (`on`), or no longer.
+    ControlsWatch { from: DeviceInfo, on: bool },
+    /// A phone didn't change one of its controls, and says why.
+    ControlsRefused { from: DeviceInfo, what: String, reason: String },
     /// A phone's call: ringing, answered, or over.
     CallState { from: DeviceInfo, state: CallState, contact: Option<String> },
     /// A device checked in ("still here").
@@ -281,6 +294,16 @@ pub enum Event {
     Location { from: DeviceInfo, lat: f64, lon: f64, accuracy_m: Option<f64>, at_ms: u64 },
     /// A device wouldn't or couldn't say where it is.
     LocationRefused { from: DeviceInfo, reason: String },
+    /// A computer asks this phone to open its camera and send what it takes (answer with
+    /// `refuse_snap` if it can't; else the picture goes out as an ordinary transfer).
+    SnapRequest { from: DeviceInfo },
+    /// A phone couldn't open its camera for a snap.
+    SnapRefused { from: DeviceInfo, reason: String },
+    /// A phone's display is turned this many degrees from its natural orientation (0, 90, 180
+    /// or 270), while a computer controls its screen.
+    ScreenRotation { from: DeviceInfo, degrees: u16 },
+    /// A notification that came up on a computer, to show here too (docs/protocol.md §4.25).
+    ComputerNotification { from: DeviceInfo, key: String, app: String, title: String, body: String, at_ms: u64 },
     /// A device asks which terminals run here for it (answer with `send_terminals`).
     TerminalListRequest { from: DeviceInfo },
     /// The terminals running on a device for this one.
@@ -331,6 +354,12 @@ pub enum Event {
     DeckState { from: DeviceInfo, states: Vec<DeckState> },
     /// The layouts a computer keeps for this phone's deck (§4.20).
     DeckLayout { from: DeviceInfo, layouts: DeckLayouts },
+    /// A phone saves the layouts it edited, made on `base_version` (§4.26).
+    DeckLayoutSave { from: DeviceInfo, base_version: u64, layouts: DeckLayouts },
+    /// A computer didn't save them (§4.26).
+    DeckLayoutRefused { from: DeviceInfo, code: DeckRefusal, reason: String, version: u64 },
+    /// A computer shows a theme on the open deck, or stops (§4.26).
+    DeckThemeDraft { from: DeviceInfo, theme: Option<DeckThemeDef> },
 }
 
 /// A running media session: the stream pair, kept open (and the connection with it) until
@@ -412,6 +441,10 @@ pub struct DeviceView {
     /// Connected away from home, over the internet (docs/protocol.md §4.13).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub away: bool,
+    /// Away from home: whether its packets go through the relay (slower) or straight
+    /// between the two. None while that isn't known, and when it isn't away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub away_relay: Option<bool>,
     /// A direct link (Wi-Fi Direct, §4.17) to it is up: big transfers go over it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
@@ -622,6 +655,8 @@ struct Inner {
     /// Transfers this device asked for (photos from a gallery), taken without asking into
     /// their folder: by id, from whom, where, and since when.
     expected: Mutex<HashMap<Uuid, (Fingerprint, PathBuf, Instant)>>,
+    /// Phones asked for a snap, and until when their picture is taken without asking.
+    snap_wait: Mutex<HashMap<Fingerprint, Instant>>,
     /// Terminal requests, for whoever runs terminals (the daemon on a computer).
     terminals: Mutex<Option<mpsc::UnboundedReceiver<TerminalCall>>>,
     terminals_tx: mpsc::UnboundedSender<TerminalCall>,
@@ -639,6 +674,10 @@ struct Inner {
     media_seq: Mutex<HashMap<Fingerprint, u64>>,
     /// The same for volume.
     volume_seq: Mutex<HashMap<Fingerprint, u64>>,
+    /// The same for a phone's controls.
+    controls_seq: Mutex<HashMap<Fingerprint, u64>>,
+    /// The channel (MHz) of this computer's Wi-Fi, told to a host asked for a direct link.
+    wifi_frequency: Mutex<Option<u32>>,
     /// Away from home, when on (docs/protocol.md §4.13).
     away: Mutex<Option<Arc<crate::away::Away>>>,
     /// Direct links up, for big transfers (docs/protocol.md §4.17).
@@ -702,6 +741,8 @@ impl Node {
                 batteries: Mutex::default(),
                 media_seq: Mutex::default(),
                 volume_seq: Mutex::default(),
+                controls_seq: Mutex::default(),
+                wifi_frequency: Mutex::default(),
                 sessions: Mutex::new(Some(sessions)),
                 sessions_tx,
                 fs: Mutex::new(Some(fs)),
@@ -711,6 +752,7 @@ impl Node {
                 preflight: Mutex::new(Some(preflight)),
                 preflight_tx,
                 expected: Mutex::default(),
+                snap_wait: Mutex::default(),
                 terminals: Mutex::new(Some(terminals)),
                 terminals_tx,
                 unsupported: Mutex::new(Default::default()),
@@ -824,6 +866,7 @@ impl Node {
         let peers = self.inner.peers.lock().unwrap();
         let nearby = self.inner.nearby.lock().unwrap();
         let batteries = self.inner.batteries.lock().unwrap();
+        let bridges = self.inner.away.lock().unwrap().clone();
         let lanes: std::collections::HashSet<Fingerprint> = self.inner.lanes.lock().unwrap().iter().filter(|(_, l)| l.conn.close_reason().is_none()).map(|(id, _)| *id).collect();
         let mut out: Vec<DeviceView> = trust
             .list()
@@ -833,6 +876,7 @@ impl Node {
                 connected: peers.contains_key(&t.device.id),
                 usb: self.link_and_addr(&t.device.id).is_some_and(|(l, _)| l == Link::Usb),
                 away: self.link_and_addr(&t.device.id).is_some_and(|(l, _)| l == Link::Away),
+                away_relay: peers.get(&t.device.id).map(|p| p.conn.remote_address()).filter(|a| link_of(*a) == Link::Away).and_then(|a| bridges.as_ref().and_then(|b| b.relayed(a))),
                 direct: lanes.contains(&t.device.id),
                 away_all: t.away_all,
                 auto_accept: t.auto_accept,
@@ -859,7 +903,7 @@ impl Node {
             .collect();
         for (id, (device, _)) in nearby.iter() {
             if !trust.contains(id) {
-                out.push(DeviceView { device: device.clone(), trusted: false, connected: false, nearby: true, battery: None, usb: false, away: false, direct: false, away_all: false, away_until: None, auto_accept: false, allow_screen: false, latency_ms: None });
+                out.push(DeviceView { device: device.clone(), trusted: false, connected: false, nearby: true, battery: None, usb: false, away: false, away_relay: None, direct: false, away_all: false, away_until: None, auto_accept: false, allow_screen: false, latency_ms: None });
             }
         }
         // Paired and reachable first, then devices to pair, then paired ones that are away.
@@ -900,6 +944,11 @@ impl Node {
     /// Whether a pairing, transfer or session request still waits for an answer.
     pub fn is_pending(&self, request: Uuid) -> bool {
         self.inner.pending.lock().unwrap().contains_key(&request)
+    }
+
+    /// The address a paired device was last reached at, if it ever was.
+    pub fn last_address(&self, id: &Fingerprint) -> Option<SocketAddr> {
+        self.inner.trust.lock().unwrap().get(id).and_then(|t| t.last_addr)
     }
 
     /// Reconnect to an already paired device at a known address.
@@ -1020,6 +1069,22 @@ impl Node {
         self.send_message(to, &Message::Notify { title: title.into(), body: body.into() }).await
     }
 
+    /// Tell a computer how far this phone's display is turned from its natural orientation, so
+    /// it puts taps where they belong. Only 0, 90, 180 and 270.
+    pub async fn send_screen_rotation(&self, to: &Fingerprint, degrees: u16) -> Result<()> {
+        if degrees >= 360 || !degrees.is_multiple_of(90) {
+            return Err(Error::Protocol("a rotation is 0, 90, 180 or 270 degrees".into()));
+        }
+        self.send_message(to, &Message::ScreenRotation { degrees }).await
+    }
+
+    /// Show a notification of this computer on a phone (`computer_notifications`, §4.25). The
+    /// texts are cut to what a notification holds.
+    pub async fn send_computer_notification(&self, to: &Fingerprint, key: &str, app: &str, title: &str, body: &str, at_ms: u64) -> Result<()> {
+        let cut = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+        self.send_message(to, &Message::ComputerNotification { key: cut(key, 80), app: cut(app, 80), title: cut(title, 200), body: cut(body, 1000), at_ms }).await
+    }
+
     /// Share clipboard text with a connected device.
     pub async fn send_clipboard(&self, to: &Fingerprint, text: &str) -> Result<()> {
         if text.is_empty() {
@@ -1132,6 +1197,29 @@ impl Node {
         self.send_message(to, &Message::DeckLayout { layouts: layouts.clone() }).await
     }
 
+    /// The layouts a phone edited (§4.26), to a connected computer that announces
+    /// `deck_layout_save` ([`Error::Unsupported`] otherwise: the phone keeps them).
+    pub async fn deck_layout_save(&self, to: &Fingerprint, base_version: u64, layouts: &DeckLayouts) -> Result<()> {
+        if !self.peer_info(to).is_some_and(|p| p.features.iter().any(|f| f == "deck_layout_save")) {
+            return Err(Error::Unsupported);
+        }
+        self.send_message(to, &Message::DeckLayoutSave { base_version, layouts: layouts.clone() }).await
+    }
+
+    /// Nothing was saved (§4.26): why, and the version this computer has.
+    pub async fn deck_layout_refused(&self, to: &Fingerprint, code: DeckRefusal, reason: &str, version: u64) -> Result<()> {
+        self.send_message(to, &Message::DeckLayoutRefused { code, reason: reason.into(), version }).await
+    }
+
+    /// A theme for the phone's open deck to show without keeping it, or `None` to stop
+    /// (§4.26), to a connected phone that announces `deck_themes`.
+    pub async fn deck_theme_draft(&self, to: &Fingerprint, theme: Option<&DeckThemeDef>) -> Result<()> {
+        if !self.peer_info(to).is_some_and(|p| p.features.iter().any(|f| f == "deck_themes")) {
+            return Err(Error::Unsupported);
+        }
+        self.send_message(to, &Message::DeckThemeDraft { theme: theme.cloned() }).await
+    }
+
     /// The mirrored notification `key` is gone here.
     pub async fn remove_notification(&self, to: &Fingerprint, key: &str) -> Result<()> {
         self.send_message(to, &Message::NotificationRemoved { key: key.into(), reply_kept: false }).await
@@ -1218,6 +1306,34 @@ impl Node {
         self.send_message(to, &Message::VolumeWatch { on }).await
     }
 
+    /// Send this phone's controls (bump `seq` each time).
+    pub async fn send_controls_state(&self, to: &Fingerprint, state: &ControlsState) -> Result<()> {
+        if ![state.media, state.ringtone, state.alarm].iter().all(|l| l.is_finite()) {
+            return Err(invalid("a volume isn't a number"));
+        }
+        self.send_message(to, &Message::ControlsState(*state)).await
+    }
+
+    /// Change some of a phone's controls: only the ones given (levels kept within 0 to 1).
+    pub async fn set_controls(&self, to: &Fingerprint, change: ControlsChange) -> Result<()> {
+        let change = change.tidy();
+        if change.is_empty() {
+            return Err(invalid("nothing to change"));
+        }
+        self.send_message(to, &Message::ControlsSet(change)).await
+    }
+
+    /// Ask a phone for its controls while connected (`on`), or stop.
+    pub async fn watch_controls(&self, to: &Fingerprint, on: bool) -> Result<()> {
+        self.send_message(to, &Message::ControlsWatch { on }).await
+    }
+
+    /// Answer `Event::ControlsSet` for one control that wasn't changed (`media`, `ringtone`,
+    /// `alarm`, `ringer`, `dnd`, `flashlight`), with why.
+    pub async fn refuse_controls(&self, to: &Fingerprint, what: &str, reason: &str) -> Result<()> {
+        self.send_message(to, &Message::ControlsRefused { what: what.into(), reason: reason.into() }).await
+    }
+
     /// Tell a device about a call on this one (phones), so it can pause its media.
     pub async fn send_call_state(&self, to: &Fingerprint, state: CallState, contact: Option<&str>) -> Result<()> {
         self.send_message(to, &Message::CallState { state, contact: contact.map(Into::into) }).await
@@ -1237,6 +1353,38 @@ impl Node {
     /// Answer `Event::LocateRequest` with no: turned off, no permission, no fix.
     pub async fn refuse_location(&self, to: &Fingerprint, reason: &str) -> Result<()> {
         self.send_message(to, &Message::LocationRefused { reason: reason.into() }).await
+    }
+
+    /// Ask a phone to open its camera and send what it takes (docs/protocol.md §4.23). Only
+    /// for a phone that announces `snap` ([`Error::Unsupported`] otherwise). For the next two
+    /// minutes one picture or page from it is taken without asking; the phone says
+    /// `Event::SnapRefused` when it can't.
+    pub async fn request_snap(&self, to: &Fingerprint) -> Result<()> {
+        if !self.peer_info(to).is_some_and(|p| p.features.iter().any(|f| f == "snap")) {
+            return Err(Error::Unsupported);
+        }
+        self.send_message(to, &Message::SnapRequest).await?;
+        self.inner.snap_wait.lock().unwrap().insert(*to, Instant::now());
+        Ok(())
+    }
+
+    /// Answer `Event::SnapRequest` with no: turned off, no camera permission, camera in use.
+    pub async fn refuse_snap(&self, to: &Fingerprint, reason: &str) -> Result<()> {
+        self.send_message(to, &Message::SnapRefused { reason: reason.into() }).await
+    }
+
+    /// Whether this offer is the picture a phone was asked for (`request_snap`): one image or
+    /// PDF of a sensible size, within two minutes of the request. Uses the request up.
+    fn is_asked_snap(&self, from: &Fingerprint, files: &[FileEntry]) -> bool {
+        let [file] = files else { return false };
+        let name = file.path.to_ascii_lowercase();
+        let kind = ["jpg", "jpeg", "png", "webp", "heic", "heif", "pdf"].iter().any(|e| name.ends_with(&format!(".{e}")));
+        if !kind || file.size > MAX_SNAP {
+            return false;
+        }
+        let mut wait = self.inner.snap_wait.lock().unwrap();
+        wait.retain(|_, at| at.elapsed() < SNAP_WAIT);
+        wait.remove(from).is_some()
     }
 
     /// Ask a computer which terminals run there for this device (`Event::Terminals`).
@@ -1731,6 +1879,11 @@ impl Node {
         self.inner.peers.lock().unwrap().get(id).map(|p| p.device.clone())
     }
 
+    /// Whether a connected device announced `feature`.
+    pub fn peer_has(&self, id: &Fingerprint, feature: &str) -> bool {
+        self.peer_info(id).is_some_and(|p| p.features.iter().any(|f| f == feature))
+    }
+
     /// Where a connected device's connection comes from now (over the USB cable, the
     /// bridge's local port).
     pub fn peer_address(&self, id: &Fingerprint) -> Option<SocketAddr> {
@@ -2195,6 +2348,31 @@ impl Node {
                                     }
                                 }
                                 Ok(Message::VolumeWatch { on }) => node.emit(Event::VolumeWatch { from, on }),
+                                Ok(Message::ControlsState(state)) if [state.media, state.ringtone, state.alarm].iter().all(|l| l.is_finite()) => {
+                                    let newer = {
+                                        let mut seqs = node.inner.controls_seq.lock().unwrap();
+                                        let last = seqs.entry(from.id).or_insert(0);
+                                        let newer = state.seq > *last;
+                                        if newer {
+                                            *last = state.seq;
+                                        }
+                                        newer
+                                    };
+                                    if newer {
+                                        node.emit(Event::ControlsState { from, state });
+                                    }
+                                }
+                                Ok(Message::ControlsState(_)) => debug!("bad controls from {}", from.name),
+                                Ok(Message::ControlsSet(change)) => {
+                                    let change = change.tidy();
+                                    if !change.is_empty() {
+                                        node.emit(Event::ControlsSet { from, change });
+                                    }
+                                }
+                                Ok(Message::ControlsWatch { on }) => node.emit(Event::ControlsWatch { from, on }),
+                                Ok(Message::ControlsRefused { what, reason }) => {
+                                    node.emit(Event::ControlsRefused { from, what: what.chars().take(40).collect(), reason: reason.chars().take(200).collect() })
+                                }
                                 Ok(Message::CallState { state, contact }) => node.emit(Event::CallState { from, state, contact }),
                                 Ok(Message::Heartbeat) => node.emit(Event::Heartbeat { from }),
                                 Ok(Message::ClipboardWatch { on }) => node.emit(Event::ClipboardWatch { from, on }),
@@ -2209,6 +2387,17 @@ impl Node {
                                 }
                                 Ok(Message::LocationRefused { reason }) => {
                                     node.emit(Event::LocationRefused { from, reason: reason.chars().take(200).collect() })
+                                }
+                                Ok(Message::ScreenRotation { degrees }) if degrees < 360 && degrees.is_multiple_of(90) => node.emit(Event::ScreenRotation { from, degrees }),
+                                Ok(Message::ScreenRotation { .. }) => debug!("bad rotation from {}", from.name),
+                                Ok(Message::ComputerNotification { key, app, title, body, at_ms }) => {
+                                    let cut = |s: String, n: usize| s.chars().take(n).collect::<String>();
+                                    node.emit(Event::ComputerNotification { from, key: cut(key, 80), app: cut(app, 80), title: cut(title, 200), body: cut(body, 1000), at_ms })
+                                }
+                                Ok(Message::SnapRequest) => node.emit(Event::SnapRequest { from }),
+                                Ok(Message::SnapRefused { reason }) => {
+                                    node.inner.snap_wait.lock().unwrap().remove(&from.id);
+                                    node.emit(Event::SnapRefused { from, reason: reason.chars().take(200).collect() })
                                 }
                                 Ok(Message::Picture { image }) => {
                                     if image.len() <= MAX_PICTURE {
@@ -2262,6 +2451,11 @@ impl Node {
                                 Ok(Message::DeckState { states }) if states.len() <= MAX_DECK => node.emit(Event::DeckState { from, states }),
                                 Ok(Message::DeckRun { .. } | Message::DeckActions { .. } | Message::DeckState { .. }) => debug!("bad deck message from {}", from.name),
                                 Ok(Message::DeckLayout { layouts }) => node.emit(Event::DeckLayout { from, layouts }),
+                                Ok(Message::DeckLayoutSave { base_version, layouts }) => node.emit(Event::DeckLayoutSave { from, base_version, layouts }),
+                                Ok(Message::DeckLayoutRefused { code, reason, version }) if reason.len() <= MAX_KEY => node.emit(Event::DeckLayoutRefused { from, code, reason, version }),
+                                Ok(Message::DeckLayoutRefused { .. }) => debug!("bad deck_layout_refused from {}", from.name),
+                                Ok(Message::DeckThemeDraft { theme }) if theme.as_ref().is_none_or(|t| t.check().is_ok()) => node.emit(Event::DeckThemeDraft { from, theme }),
+                                Ok(Message::DeckThemeDraft { .. }) => debug!("bad deck_theme_draft from {}", from.name),
                                 Err(e) => debug!("bad message from {}: {e}", from.name),
                             }
                         });
@@ -2412,13 +2606,18 @@ impl Node {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn handle_session(self, from: DeviceInfo, mut send: quinn::SendStream, recv: quinn::RecvStream, id: Uuid, kind: SessionKind, terminal: Option<crate::protocol::TerminalOpen>, choose: bool) {
         let decline = |reason: &str, tries_left: Option<u32>| SessionMsg::SessionDecline { reason: Some(reason.into()), tries_left };
         // From away, screens, control, camera, microphone and terminals need the user's yes
         // for this device beforehand; it isn't even asked otherwise.
         if !self.allowed_from_here(&from.id) {
             let _ = write_msg(&mut send, &decline("away", None)).await;
+            let _ = send.finish();
+            return;
+        }
+        // The sound a device plays is shared only by one that says it can (feature `sound`)
+        if kind == SessionKind::Sound && !self.info().features.iter().any(|f| f == "sound") {
+            let _ = write_msg(&mut send, &decline("unsupported", None)).await;
             let _ = send.finish();
             return;
         }
@@ -2545,7 +2744,10 @@ impl Node {
         } else {
             None
         };
+        // The picture of a snap this computer asked for is taken at once; anything else asks
+        let snapped = import_to.is_none() && !import && self.is_asked_snap(&from.id, &files);
         let auto = import_to.is_some()
+            || snapped
             || self.inner.settings.lock().unwrap().auto_accept
             || self.inner.trust.lock().unwrap().get(&from.id).is_some_and(|t| t.auto_accept);
         let accepted = auto || self.ask_offer(&from, id, &files, &apps).await;
@@ -2740,6 +2942,15 @@ impl Node {
     }
 
     /// Credentials for a group the host makes, when both devices do groups (`direct_group`).
+    /// Tell the channel this computer's Wi-Fi is on (MHz), or that it isn't on one.
+    pub fn set_wifi_frequency(&self, frequency: Option<u32>) {
+        *self.inner.wifi_frequency.lock().unwrap() = frequency.filter(|f| (2400..=7125).contains(f));
+    }
+
+    fn wifi_frequency(&self) -> Option<u32> {
+        *self.inner.wifi_frequency.lock().unwrap()
+    }
+
     fn direct_group(&self, to: &Fingerprint) -> Option<DirectGroup> {
         let has = |features: &[String]| features.iter().any(|f| f == "direct_group");
         if has(&self.info().features) && self.peer_info(to).is_some_and(|p| has(&p.features)) {
@@ -2811,7 +3022,7 @@ impl Node {
             info!("setting up a direct link");
             if host {
                 self.emit(Event::DirectWanted { id: *to, group: self.direct_group(to) });
-            } else if let Err(e) = self.send_message(to, &Message::Direct { step: DirectStep::Ask }).await {
+            } else if let Err(e) = self.send_message(to, &Message::Direct { step: DirectStep::Ask { frequency: self.wifi_frequency() } }).await {
                 self.direct_drop(to, Some(e.to_string()));
             }
         }
@@ -2873,13 +3084,15 @@ impl Node {
         };
         match step {
             // Up already: nothing to set up
-            DirectStep::Ask if self.lane(&id).is_some() => {}
-            DirectStep::Ask if self.direct_role(&id) == Some(true) => {
+            DirectStep::Ask { .. } if self.lane(&id).is_some() => {}
+            DirectStep::Ask { frequency } if self.direct_role(&id) == Some(true) => {
                 if self.direct_begin(&id).1 {
-                    self.emit(Event::DirectWanted { id, group: self.direct_group(&id) });
+                    // The group on the joiner's channel, when it said which
+                    let group = self.direct_group(&id).map(|g| DirectGroup { frequency, ..g });
+                    self.emit(Event::DirectWanted { id, group });
                 }
             }
-            DirectStep::Ask => refuse("this device can't host a direct link"),
+            DirectStep::Ask { .. } => refuse("this device can't host a direct link"),
             DirectStep::Invite { .. } if self.direct_role(&id) != Some(false) => refuse("this device can't join a direct link"),
             DirectStep::End { reason } => {
                 self.direct_drop(&id, reason);
