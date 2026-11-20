@@ -15,7 +15,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use linksy_i18n::t;
 
-pub(crate) const APP_ID: &str = "org.kde.kdeconnectify";
+pub(crate) const APP_ID: &str = "org.kde.kdeconnectify.app";
 
 const CSS: &str = r#"
 /* Brand: Signal blue as Linksy's accent; libadwaita derives the rest. */
@@ -406,7 +406,7 @@ fn main() -> glib::ExitCode {
             let logs = gio::spawn_blocking(|| linksy_logs::collect(&linksy_upgrade::revision())).await.unwrap_or_default();
             let dialog = adw::AboutDialog::builder()
                 .application_name("Linksy")
-                .application_icon(APP_ID)
+                .application_icon("org.kde.kdeconnectify")
                 .version(env!("CARGO_PKG_VERSION"))
                 .comments(t!("Your devices, connected.\nShare files and more between nearby devices, without the cloud."))
                 .developer_name("Axel RAKOTOARIVAO")

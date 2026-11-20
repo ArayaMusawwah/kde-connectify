@@ -11,15 +11,19 @@
 //! handshake, on the same network), and only takes away connections from paired devices
 //! it met on the same network or cable in the last [`LEASE`].
 
+#[cfg(feature = "away")]
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 #[cfg(feature = "away")]
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(feature = "away")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[cfg(feature = "away")]
-use iroh::endpoint::{RecvStream, SendStream, presets};
+use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 #[cfg(feature = "away")]
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
@@ -64,6 +68,10 @@ pub struct AwayAddr {
 pub(crate) struct Away {
     endpoint: Endpoint,
     relay: Option<RelayUrl>,
+    /// The bridges up right now, by the address this node dials them on. A bridge hides the
+    /// peer behind `127.0.0.2`; keeping iroh's own connection is what lets the node ask
+    /// whether the path underneath is a direct one before it calls the link away.
+    bridges: Arc<Mutex<HashMap<SocketAddr, Connection>>>,
 }
 
 /// Built without away from home: it never starts, so nothing here is ever reached.
@@ -91,6 +99,9 @@ impl Away {
         match *self {}
     }
     pub async fn accept_loop(self: Arc<Self>, _: u16, _: impl Fn(&str) -> bool + Send + Sync + 'static) {
+        match *self {}
+    }
+    pub(crate) fn direct_of(&self, _: SocketAddr) -> Option<SocketAddr> {
         match *self {}
     }
     pub async fn close(&self) {
@@ -121,7 +132,7 @@ impl Away {
             .await
             .map_err(|e| Error::Protocol(format!("away endpoint: {e}")))?;
         info!(id = %endpoint.id().fmt_short(), relay = ?relay.as_ref().map(|r| r.to_string()), "away from home ready");
-        Ok(Arc::new(Self { endpoint, relay }))
+        Ok(Arc::new(Self { endpoint, relay, bridges: Arc::new(Mutex::new(HashMap::new())) }))
     }
 
     /// This device's away address, as it is now.
@@ -153,6 +164,21 @@ impl Away {
         self.relay == relay.and_then(|r| RelayUrl::from_str(r).ok())
     }
 
+    /// The selected direct IP path behind a live bridge, if `local` is one. Gives the node the
+    /// peer's real remote address so it can tell a local, same-network hop from a relayed one.
+    pub(crate) fn direct_of(&self, local: SocketAddr) -> Option<SocketAddr> {
+        let conn = self.bridges.lock().unwrap_or_else(|e| e.into_inner()).get(&local).cloned()?;
+        let list = conn.paths();
+        for path in list.iter() {
+            if path.is_selected() && path.is_ip() {
+                if let TransportAddr::Ip(addr) = path.remote_addr() {
+                    return Some(*addr);
+                }
+            }
+        }
+        None
+    }
+
     /// Reach `to` and bridge it: returns the local address to dial (Linksy's own QUIC
     /// handshake, with the pinned key, runs through it).
     pub async fn dial(&self, to: &AwayAddr) -> Result<SocketAddr> {
@@ -166,12 +192,21 @@ impl Away {
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Protocol(format!("away: {e}")))?;
-        let (send, recv) = conn.open_bi().await.map_err(|e| Error::Protocol(format!("away: {e}")))?;
         let udp = UdpSocket::bind((AWAY_IP, 0)).await?;
         let local = udp.local_addr()?;
+        // Keep the iroh connection so the node can ask whether its path is direct.
+        self.bridges.lock().unwrap_or_else(|e| e.into_inner()).insert(local, conn.clone());
+        let bridges = Arc::clone(&self.bridges);
         tokio::spawn(async move {
-            carry(recv, send, udp, None).await;
+            let result = async {
+                let (send, recv) = conn.open_bi().await.map_err(|e| Error::Protocol(format!("away: {e}")))?;
+                carry(recv, send, udp, None).await;
+                Ok::<(), Error>(())
+            }
+            .await;
+            let _ = result;
             conn.close(0u32.into(), b"done");
+            bridges.lock().unwrap_or_else(|e| e.into_inner()).remove(&local);
         });
         Ok(local)
     }
@@ -182,6 +217,7 @@ impl Away {
         let allowed = Arc::new(allowed);
         while let Some(incoming) = self.endpoint.accept().await {
             let allowed = allowed.clone();
+            let this = Arc::clone(&self);
             tokio::spawn(async move {
                 let Ok(accepting) = incoming.accept() else { return };
                 let Ok(conn) = accepting.await else { return };
@@ -191,10 +227,18 @@ impl Away {
                     conn.close(1u32.into(), b"not allowed");
                     return;
                 }
-                let Ok((send, recv)) = conn.accept_bi().await else { return };
                 let Ok(udp) = UdpSocket::bind((AWAY_IP, 0)).await else { return };
+                let Ok(local) = udp.local_addr() else { return };
+                let bridges = Arc::clone(&this);
+                bridges.bridges.lock().unwrap_or_else(|e| e.into_inner()).insert(local, conn.clone());
+                let Ok((send, recv)) = conn.accept_bi().await else {
+                    bridges.bridges.lock().unwrap_or_else(|e| e.into_inner()).remove(&local);
+                    conn.close(0u32.into(), b"done");
+                    return;
+                };
                 carry(recv, send, udp, Some(SocketAddr::from((Ipv4Addr::LOCALHOST, node_port)))).await;
                 conn.close(0u32.into(), b"done");
+                bridges.bridges.lock().unwrap_or_else(|e| e.into_inner()).remove(&local);
             });
         }
     }

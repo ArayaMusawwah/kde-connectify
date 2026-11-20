@@ -817,6 +817,7 @@ fn serve_files(node: &Node, root: std::path::PathBuf) {
             };
             let _: linksy_core::Result<()> = match call.request.clone() {
                 FsRequest::Info => call.info("storage").await,
+                FsRequest::Open { .. } => call.ok().await,
                 FsRequest::List { path } => match std::fs::read_dir(at(&path)) {
                     Ok(rd) => call.entries(rd.flatten().filter_map(|e| entry(&e.path())).collect()).await,
                     Err(_) => call.error("no such folder", true).await,
@@ -1470,6 +1471,9 @@ async fn away_from_home_connects_and_keeps_screens_local() {
     .await;
     assert_eq!(text, "from far away");
     assert_eq!(b.node.link(&ida), Some(Link::Away));
+    // Both nodes share this one machine, so the bridge's direct path is this machine's own
+    // address: it is still away, not the same network (two devices would be another host).
+    assert!(b.node.devices().iter().any(|d| d.device.id == ida && d.away), "same-machine away stays away");
 
     // A screen from away: refused without asking Beta's user, even allowed for good...
     let _incoming = b.node.incoming_sessions();

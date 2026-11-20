@@ -462,6 +462,31 @@ pub fn over_usb(addr: SocketAddr) -> bool {
     link_of(addr) == Link::Usb
 }
 
+/// Whether `theirs` is on the same network as one of this computer's own addresses. A
+/// link-local IPv6 address is left out: it is only reachable on the interface it came
+/// from, which the other device can't name.
+fn shares_network(mine: &if_addrs::IfAddr, theirs: IpAddr) -> bool {
+    match (mine, theirs) {
+        (if_addrs::IfAddr::V4(v4), IpAddr::V4(theirs)) => {
+            !v4.ip.is_loopback() && (u32::from(v4.ip) & u32::from(v4.netmask)) == (u32::from(theirs) & u32::from(v4.netmask))
+        }
+        (if_addrs::IfAddr::V6(v6), IpAddr::V6(theirs)) => {
+            !theirs.is_loopback() && !theirs.is_unicast_link_local() && (u128::from(v6.ip) & u128::from(v6.netmask)) == (u128::from(theirs) & u128::from(v6.netmask))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `theirs` is another host on a network this device is on: not one of its own
+/// addresses. An away bridge whose iroh path is such an address reaches the peer directly
+/// over that network (a laptop on the phone's hotspot, both in the same /24), not over the
+/// relay — so it is the same network, not away from home.
+fn another_host_here(theirs: IpAddr) -> bool {
+    let sections = if_addrs::get_if_addrs().unwrap_or_default();
+    let ours: Vec<IpAddr> = sections.iter().filter(|s| !s.addr.ip().is_loopback()).map(|s| s.addr.ip()).collect();
+    !ours.contains(&theirs) && sections.iter().any(|s| !s.addr.ip().is_loopback() && shares_network(&s.addr, theirs))
+}
+
 struct Peer {
     conn: quinn::Connection,
     device: DeviceInfo,
@@ -806,8 +831,8 @@ impl Node {
             .map(|t| DeviceView {
                 battery: batteries.get(&t.device.id).copied(),
                 connected: peers.contains_key(&t.device.id),
-                usb: peers.get(&t.device.id).is_some_and(|p| link_of(p.conn.remote_address()) == Link::Usb),
-                away: peers.get(&t.device.id).is_some_and(|p| link_of(p.conn.remote_address()) == Link::Away),
+                usb: self.link_and_addr(&t.device.id).is_some_and(|(l, _)| l == Link::Usb),
+                away: self.link_and_addr(&t.device.id).is_some_and(|(l, _)| l == Link::Away),
                 direct: lanes.contains(&t.device.id),
                 away_all: t.away_all,
                 auto_accept: t.auto_accept,
@@ -1729,6 +1754,22 @@ impl Node {
         self.inner.nearby.lock().unwrap().get(id).map(|(_, a)| a.clone()).unwrap_or_default()
     }
 
+    /// Where to dial a device that is only reachable away from home: its published away
+    /// addresses, down to the ones on networks this device is on now (a phone on a hotspot
+    /// it itself hosts, say) - plus its last LAN address for when it isn't away at all.
+    fn published_here(&self, id: &Fingerprint, port: u16) -> Vec<SocketAddr> {
+        let published = self.inner.trust.lock().unwrap().get(id).and_then(|d| d.device.away.clone()).map(|a| a.addrs).unwrap_or_default();
+        if published.is_empty() {
+            return Vec::new();
+        }
+        let sections = if_addrs::get_if_addrs().unwrap_or_default();
+        published
+            .into_iter()
+            .map(|a| SocketAddr::new(a.ip(), port))
+            .filter(|a| sections.iter().any(|s| shares_network(&s.addr, a.ip())))
+            .collect()
+    }
+
     fn is_connected(&self, id: &Fingerprint) -> bool {
         self.inner.peers.lock().unwrap().get(id).is_some_and(|p| p.conn.close_reason().is_none())
     }
@@ -1982,7 +2023,7 @@ impl Node {
     /// device that changed networks can't say goodbye on the one it left, so it's checked.
     async fn clear_stale(&self, id: &Fingerprint, new: &quinn::Connection) {
         let old = self.inner.peers.lock().unwrap().get(id).map(|p| p.conn.clone());
-        let Some(old) = old.filter(|o| o.stable_id() != new.stable_id() && o.close_reason().is_none() && link_of(o.remote_address()) >= link_of(new.remote_address())) else { return };
+        let Some(old) = old.filter(|o| o.stable_id() != new.stable_id() && o.close_reason().is_none() && self.resolve_link(o.remote_address()) >= self.resolve_link(new.remote_address())) else { return };
         if !alive(&old).await {
             debug!("{}'s old link is gone", id.short());
             old.close(0u32.into(), b"gone");
@@ -2006,7 +2047,7 @@ impl Node {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, p)| link_of(p.conn.remote_address()) != Link::Away)
+                .filter(|(_, p)| node.resolve_link(p.conn.remote_address()) != Link::Away)
                 .map(|(id, p)| (*id, p.conn.clone(), p.peer_stays))
                 .collect();
             for (id, conn, peer_stays) in links {
@@ -2036,7 +2077,7 @@ impl Node {
                 // A cable beats the network, which beats away from home; both sides see which
                 // link each connection is. Otherwise both sides dialed at once: keep the
                 // connection opened by the smaller id, which both sides agree on.
-                let (new_link, old_link) = (link_of(conn.remote_address()), link_of(existing.conn.remote_address()));
+                let (new_link, old_link) = (self.resolve_link(conn.remote_address()), self.resolve_link(existing.conn.remote_address()));
                 let keep_old = if new_link != old_link { old_link > new_link } else { existing.dialer < dialer };
                 if existing.conn.close_reason().is_none() && keep_old {
                     conn.close(0u32.into(), b"duplicate");
@@ -2046,7 +2087,8 @@ impl Node {
             }
             peers.insert(id, Peer { conn: conn.clone(), device: device.clone(), dialer, activity: Activity::new(), peer_stays });
         }
-        if let Err(e) = self.inner.trust.lock().unwrap().touch(&device, conn.remote_address()) {
+        let real = self.bridge_direct(conn.remote_address()).unwrap_or(conn.remote_address());
+        if let Err(e) = self.inner.trust.lock().unwrap().touch(&device, real) {
             warn!("could not save device address: {e}");
         }
         if self.inner.trust.lock().unwrap().contains(&id) {
@@ -2298,7 +2340,8 @@ impl Node {
             change(&mut p.device);
             (p.device.clone(), p.conn.remote_address())
         };
-        if let Err(e) = self.inner.trust.lock().unwrap().touch(&device.0, device.1) {
+        let real = self.bridge_direct(device.1).unwrap_or(device.1);
+        if let Err(e) = self.inner.trust.lock().unwrap().touch(&device.0, real) {
             warn!("could not save device details: {e}");
         }
         self.emit(Event::DeviceUpdated { device: device.0 });
@@ -3140,7 +3183,32 @@ impl Node {
 
     /// How a connected device is reached now.
     pub fn link(&self, id: &Fingerprint) -> Option<Link> {
-        self.inner.peers.lock().unwrap().get(id).map(|p| link_of(p.conn.remote_address()))
+        self.link_and_addr(id).map(|(l, _)| l)
+    }
+
+    /// What link `addr` really is: an away bridge whose iroh path is a direct one on a
+    /// network we share is the same network, not away from home.
+    fn resolve_link(&self, addr: SocketAddr) -> Link {
+        if link_of(addr) != Link::Away {
+            return link_of(addr);
+        }
+        match self.bridge_direct(addr).filter(|real| another_host_here(real.ip())) {
+            Some(_) => Link::Lan,
+            None => Link::Away,
+        }
+    }
+
+    /// How a connected device is reached now, and where: an away bridge that turns out to
+    /// run over a network we share reports the real address under it, not `127.0.0.2`.
+    fn link_and_addr(&self, id: &Fingerprint) -> Option<(Link, SocketAddr)> {
+        let addr = self.inner.peers.lock().unwrap().get(id)?.conn.remote_address();
+        let link = self.resolve_link(addr);
+        Some((link, self.bridge_direct(addr).unwrap_or(addr)))
+    }
+
+    /// The peer's real address behind the away bridge on `addr`, if that bridge is up.
+    fn bridge_direct(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        self.inner.away.lock().unwrap().clone().and_then(|a| a.direct_of(addr))
     }
 
     /// Allow everything from away for a paired device (screens, files, camera…), or only
@@ -3344,6 +3412,29 @@ mod tests {
         assert!(tokio::time::timeout(Duration::from_secs(1), first_ok(slow, fails)).await.is_err());
         let both = first_ok(async { Err::<i32, _>(Error::Timeout) }, async { Err(Error::NotPaired) }).await;
         assert!(matches!(both, Err(Error::Timeout)));
+    }
+
+    #[test]
+    fn away_bridge_same_network_is_lan_but_our_own_address_is_not() {
+        // A laptop on the phone's hotspot: the peer's address on a network we share is
+        // another host, so the bridge under it counts as the same network...
+        let v4 = if_addrs::get_if_addrs().unwrap_or_default().into_iter().find_map(|s| match s.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(v4),
+            _ => None,
+        });
+        let Some(v4) = v4 else { return eprintln!("no non-loopback IPv4 address: skipped"); };
+        // ...but our own address is not: both nodes on one machine keep the Away link, so
+        // tests/node.rs away_from_home_connects_and_keeps_screens_local still sees away.
+        assert!(!another_host_here(IpAddr::V4(v4.ip)), "our own address is not another host");
+        let mask = u32::from(v4.netmask);
+        if mask.count_zeros() < 2 {
+            return eprintln!("the only network has no room for another host: skipped");
+        }
+        let network = u32::from(v4.ip) & mask;
+        let peer = if u32::from(v4.ip) == network + 1 { network + 2 } else { network + 1 };
+        assert!(another_host_here(IpAddr::V4(std::net::Ipv4Addr::from(peer))), "a free address on our network is another host");
+        // A public address (a holepunched relay peer) is not on any network we share.
+        assert!(!another_host_here("8.8.8.8".parse().unwrap()), "a public address is not another host here");
     }
 
     async fn test_node(dir: &std::path::Path) -> Node {
