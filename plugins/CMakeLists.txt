@@ -26,6 +26,7 @@ add_subdirectory(webcam)
 add_subdirectory(microphone)
 add_subdirectory(sidecar)
 add_subdirectory(screenmirror)
+add_subdirectory(adbcontrol)
 add_subdirectory(terminal)
 
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")

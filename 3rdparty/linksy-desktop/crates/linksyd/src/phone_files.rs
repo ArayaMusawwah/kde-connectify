@@ -21,8 +21,9 @@ use crate::history::History;
 
 pub static FILES: OnceLock<PhoneFiles> = OnceLock::new();
 
-/// Each read from the phone, and each write to it.
-const CHUNK: u64 = 1 << 20;
+/// Each read from the phone, and each write to it: the most the protocol takes at once,
+/// so a transfer spends its time moving bytes rather than waiting on round trips.
+const CHUNK: u64 = linksy_core::fs::MAX_CHUNK;
 /// Reads asked for at once, so the phone's answers overlap the round trips.
 const AHEAD: usize = 4;
 /// Progress at most this often per copy, and once at the end.
@@ -310,6 +311,10 @@ impl Op {
         let (dest, mut part, mut file) = claim(want).await?;
         self.name = split(path).1.to_string();
         let size = entry.size;
+        // A big file is worth a direct link: have one coming up before the reads start, so
+        // they move over to it by themselves when it is up. Small ones stay on the network.
+        // Best effort: a failure here only means the usual way.
+        let _ = self.files.node.prepare_send(&self.phone, size).await;
         let mut ahead = Ahead::default();
         let (mut asked, mut at) = (0, 0);
         while at < size {
@@ -798,6 +803,7 @@ mod tests {
             FsRequest::List { path } | FsRequest::Stat { path } | FsRequest::Read { path, .. } | FsRequest::Write { path, .. } => path.clone(),
             FsRequest::Mkdir { path } | FsRequest::Delete { path } | FsRequest::Rename { path, .. } => path.clone(),
             FsRequest::Info => String::new(),
+            FsRequest::Open { path } => path.clone(),
         };
         if path.starts_with("/private") {
             let _ = call.error("Permission denied", false).await;
@@ -828,6 +834,7 @@ mod tests {
                 }
                 FsRequest::Rename { path, to } => std::fs::rename(at(&path), at(&to)).map(|_| Reply::Ok)?,
                 FsRequest::Info => Reply::Ok,
+                FsRequest::Open { .. } => Reply::Ok,
             })
         })();
         let _ = match done {

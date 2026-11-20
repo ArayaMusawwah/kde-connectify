@@ -18,6 +18,7 @@ mod lock;
 mod mirror;
 #[cfg(target_os = "linux")]
 mod network;
+mod files_server;
 mod phone_files;
 mod photos;
 mod pictures;
@@ -303,6 +304,7 @@ async fn run() -> ExitCode {
     }
     let away = lock::Away::load(data_dir.join("lock.json"));
     tokio::spawn(away.clone().run(node.clone(), history.clone()));
+    tokio::spawn(files_server::run(node.clone()));
     #[cfg(target_os = "linux")]
     tokio::spawn(tray::run(tray::Service {
         node: node.clone(),

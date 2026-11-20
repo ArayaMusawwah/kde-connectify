@@ -1,0 +1,17 @@
+{
+    "$schema": "../kdeconnect.schema.json",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "info@kdeconnect.org",
+                "Name": "Super KDE Connect Contributors"
+            }
+        ],
+        "Description": "Drive an Android phone from the computer via ADB (tap, swipe, keys, text, scrcpy view), like scrcpy does",
+        "Icon": "preferences-desktop-display",
+        "Id": "kdeconnect_adbcontrol",
+        "Name": "ADB Control (scrcpy-style)"
+    },
+    "X-KdeConnect-OutgoingPacketType": [],
+    "X-KdeConnect-SupportedPacketType": []
+}

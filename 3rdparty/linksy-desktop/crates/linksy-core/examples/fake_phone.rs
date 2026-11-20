@@ -897,6 +897,7 @@ async fn serve(mut call: linksy_core::fs::FsCall, root: &std::path::Path) {
     }
     let done: std::io::Result<Answer> = (|| match call.request.clone() {
         FsRequest::Info => Ok(Answer::Info(root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+        FsRequest::Open { .. } => Ok(Answer::Ok),
         FsRequest::List { path } => Ok(Answer::Entries(std::fs::read_dir(at(&path)?)?.flatten().filter_map(|e| entry(&e.path())).collect())),
         FsRequest::Stat { path } => entry(&at(&path)?).map(Answer::Entry).ok_or_else(|| std::io::ErrorKind::NotFound.into()),
         FsRequest::Read { path, offset, length } => {

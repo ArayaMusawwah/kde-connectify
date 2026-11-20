@@ -590,6 +590,8 @@ pub enum FsRequest {
     /// What's shared, to label it ("Pixel 9 (Documents)") → `fs_info`. Optional: a device
     /// that doesn't know it answers `fs_error`.
     Info,
+    /// Open a file here: `xdg-open` on the resolved path. Answered `fs_ok`.
+    Open { path: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

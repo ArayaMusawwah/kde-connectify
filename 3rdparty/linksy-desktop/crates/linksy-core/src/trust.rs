@@ -120,9 +120,11 @@ impl TrustStore {
         }
         d.device = device;
         // A USB or away bridge's address is only good while it lasts: keep the network
-        // one (a cable's, for lack of one: tests on one machine have nothing else).
+        // one (a cable's, for lack of one: tests on one machine have nothing else). A
+        // link-local IPv6 address is kept out: it carries an interface index from this
+        // machine, and the other device has no way to use it.
         match crate::node::link_of(addr) {
-            crate::node::Link::Lan => d.last_addr = Some(addr),
+            crate::node::Link::Lan if !is_link_local_v6(addr) => d.last_addr = Some(addr),
             crate::node::Link::Usb if d.last_addr.is_none() => d.last_addr = Some(addr),
             _ => {}
         }
@@ -180,6 +182,12 @@ impl TrustStore {
         std::fs::rename(tmp, path)?;
         Ok(())
     }
+}
+
+/// Whether this is a link-local IPv6 address: it carries the interface index of the
+/// machine that saved it in its scope id, which another device can't resolve.
+fn is_link_local_v6(addr: SocketAddr) -> bool {
+    matches!(addr, SocketAddr::V6(v6) if v6.ip().is_unicast_link_local())
 }
 
 #[cfg(test)]
