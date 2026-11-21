@@ -868,14 +868,17 @@ impl Node {
         let batteries = self.inner.batteries.lock().unwrap();
         let bridges = self.inner.away.lock().unwrap().clone();
         let lanes: std::collections::HashSet<Fingerprint> = self.inner.lanes.lock().unwrap().iter().filter(|(_, l)| l.conn.close_reason().is_none()).map(|(id, _)| *id).collect();
+        // `link_and_addr` locks `peers` itself: same thread taking it again here would
+        // deadlock, so resolve the link from the guard already held.
+        let link_now = |id: &Fingerprint| -> Option<Link> { peers.get(id).map(|p| self.resolve_link(p.conn.remote_address())) };
         let mut out: Vec<DeviceView> = trust
             .list()
             .into_iter()
             .map(|t| DeviceView {
                 battery: batteries.get(&t.device.id).copied(),
                 connected: peers.contains_key(&t.device.id),
-                usb: self.link_and_addr(&t.device.id).is_some_and(|(l, _)| l == Link::Usb),
-                away: self.link_and_addr(&t.device.id).is_some_and(|(l, _)| l == Link::Away),
+                usb: link_now(&t.device.id).is_some_and(|l| l == Link::Usb),
+                away: link_now(&t.device.id).is_some_and(|l| l == Link::Away),
                 away_relay: peers.get(&t.device.id).map(|p| p.conn.remote_address()).filter(|a| link_of(*a) == Link::Away).and_then(|a| bridges.as_ref().and_then(|b| b.relayed(a))),
                 direct: lanes.contains(&t.device.id),
                 away_all: t.away_all,

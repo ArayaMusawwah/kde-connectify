@@ -2475,3 +2475,12 @@ async fn a_device_without_room_says_so_when_it_declines() {
     assert!(reason.contains("Beta doesn't have room for this"), "{reason}");
     assert!(reason.contains("4.1 KB"), "{reason}");
 }
+
+#[tokio::test]
+async fn devices_does_not_deadlock_with_a_paired_peer() {
+    // `devices()` used to lock `peers` and then call `link_and_addr()`, which locks it
+    // again: same thread, std mutex, no reentrancy -> the whole app froze on startup.
+    let (a, _b) = paired().await;
+    let views = tokio::time::timeout(Duration::from_secs(5), async { a.node.devices() }).await.expect("devices() came back");
+    assert!(views.iter().any(|d| d.trusted), "the paired device is listed");
+}
